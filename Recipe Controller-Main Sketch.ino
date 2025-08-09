@@ -841,7 +841,7 @@ void setupWebServer() {
   
   // Handle CORS
   server.on("/status", HTTP_OPTIONS, handleCORS);
-  server.on("/toggle", HTTP_OPTIONS, handleCO
+  server.on("/toggle", HTTP_OPTIONS, handleCORS);
 // Handle CORS
   server.on("/status", HTTP_OPTIONS, handleCORS);
   server.on("/toggle", HTTP_OPTIONS, handleCORS);
