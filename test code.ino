@@ -10,14 +10,7 @@
  * 
  * POWER MONITORING:
  * - GPIO 34 (V_PIN) -> ZMPT101B voltage sensor output
- *   * Connect ZMPT101B VCC to 3.3V, GND to GND
- *   * Add 10kΩ + 10kΩ voltage divider for 1.65V bias (mid-rail)
- *   * Connect sensor output through 1kΩ resistor to GPIO 34
- * 
  * - GPIO 35 (I_PIN) -> SCT013 current transformer
- *   * Use 33Ω burden resistor across SCT013 output
- *   * Add 10kΩ + 10kΩ voltage divider for 1.65V bias
- *   * Connect CT output through bias network to GPIO 35
  * 
  * CALIBRATION:
  * ============
@@ -27,16 +20,6 @@
  * 4. Calculate: New CV1 = (Vreal * 1000) / Vesp32
  * 5. Calculate: New CI1 = (Ireal * 1000) / Iesp32
  * 6. Replace V_CALIB and I_CALIB values below
- * 
- * DEPLOYMENT:
- * ===========
- * 1. Install LittleFS plugin for Arduino IDE
- * 2. Create 'data' folder in sketch directory
- * 3. Files will be embedded in code (no separate upload needed)
- * 4. Connect to WiFi: SSID "ESP32-RecipeAP", Password "recipe123"
- * 5. Browse to 192.168.4.1
- * 
- * NOTE: For higher precision, consider ADS1115 16-bit ADC module
  */
 
 #include <WiFi.h>
@@ -46,50 +29,41 @@
 #include <Ticker.h>
 
 // ==================== CONFIGURATION ====================
-// WiFi Access Point Settings (CHANGE THESE AS NEEDED)
 #define AP_SSID "ESP32-RecipeAP"
-#define AP_PASSWORD "recipe123"  // Change this password!
+#define AP_PASSWORD "recipe123"
 
-// GPIO Pin Assignments (SAFE DEFAULTS - change if needed)
-#define SPEED1_PIN 16    // Speed 1 relay/output
-#define SPEED2_PIN 17    // Speed 2 relay/output  
-#define SPEED3_PIN 5     // Speed 3 relay/output
-#define V_PIN 34         // ZMPT101B voltage sensor (ADC1_CH6)
-#define I_PIN 35         // SCT013 current sensor (ADC1_CH7)
+#define SPEED1_PIN 16
+#define SPEED2_PIN 17  
+#define SPEED3_PIN 5
+#define V_PIN 34
+#define I_PIN 35
 
-// Calibration Constants (REPLACE AFTER CALIBRATION!)
-#define V_CALIB 1000     // Replace with CV1 from calibration
-#define I_CALIB 1000     // Replace with CI1 from calibration
+#define V_CALIB 1000
+#define I_CALIB 1000
 
-// System Settings
-#define UPDATE_INTERVAL 1000  // Sensor reading interval (ms)
-#define SAMPLES 100           // Number of ADC samples for RMS
-#define ADC_BITS 12          // ESP32 ADC resolution
-#define ADC_MAX 4095         // Maximum ADC value
-#define VREF 3.3             // Reference voltage
+#define UPDATE_INTERVAL 1000
+#define SAMPLES 100
+#define ADC_BITS 12
+#define ADC_MAX 4095
+#define VREF 3.3
 
 // ==================== GLOBAL VARIABLES ====================
 WebServer server(80);
 Ticker sensorTicker;
 Ticker recipeTimer;
 
-// Power monitoring variables
 float voltage = 0.0;
 float current = 0.0;
 float power = 0.0;
-
-// Speed control state (0=OFF, 1=SPEED1, 2=SPEED2, 3=SPEED3)
 int currentSpeed = 0;
-
-// Recipe execution state
 bool recipeRunning = false;
 unsigned long recipeStartTime = 0;
 unsigned long recipeDuration = 0;
 int recipeSpeed = 0;
 unsigned long recipeRemainingTime = 0;
 
-// ==================== EMBEDDED WEB FILES ====================
-const char* indexHTML = R"rawliteral(
+// ==================== HTML CONTENT (SPLIT INTO PARTS) ====================
+const char* htmlPart1 = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -193,8 +167,9 @@ const char* indexHTML = R"rawliteral(
             text-transform: uppercase;
             letter-spacing: 1px;
         }
-        
-        /* Toggle Switch Styles */
+)rawliteral";
+
+const char* htmlPart2 = R"rawliteral(
         .speed-controls {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -322,8 +297,9 @@ const char* indexHTML = R"rawliteral(
             border-color: #667eea;
             outline: none;
         }
-        
-        /* Excel-like Ingredient Table */
+)rawliteral";
+
+const char* htmlPart3 = R"rawliteral(
         .ingredient-table {
             background: white;
             border-radius: 10px;
@@ -429,8 +405,9 @@ const char* indexHTML = R"rawliteral(
         .btn-danger {
             background: linear-gradient(45deg, #ff6b6b, #ee5a5a);
         }
-        
-        /* Recipe Display Cards */
+)rawliteral";
+
+const char* htmlPart4 = R"rawliteral(
         .recipe-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
@@ -616,35 +593,19 @@ const char* indexHTML = R"rawliteral(
         }
         
         @media (max-width: 768px) {
-            .container {
-                padding: 10px;
-            }
-            
-            .power-grid {
-                grid-template-columns: 1fr 1fr;
-            }
-            
-            .speed-controls {
-                grid-template-columns: repeat(2, 1fr);
-            }
-            
-            .table-header,
-            .ingredient-row {
-                grid-template-columns: 1.5fr 1fr 1fr 40px;
-            }
-            
-            .recipe-summary {
-                grid-template-columns: 1fr;
-            }
-            
-            .ingredient-item {
-                grid-template-columns: 1fr;
-                text-align: center;
-            }
+            .container { padding: 10px; }
+            .power-grid { grid-template-columns: 1fr 1fr; }
+            .speed-controls { grid-template-columns: repeat(2, 1fr); }
+            .table-header, .ingredient-row { grid-template-columns: 1.5fr 1fr 1fr 40px; }
+            .recipe-summary { grid-template-columns: 1fr; }
+            .ingredient-item { grid-template-columns: 1fr; text-align: center; }
         }
     </style>
 </head>
 <body>
+)rawliteral";
+
+const char* htmlPart5 = R"rawliteral(
     <div class="container">
         <div class="header">
             <h1>Recipe Controller</h1>
@@ -691,7 +652,41 @@ const char* indexHTML = R"rawliteral(
                             <span class="slider"></span>
                         </label>
                     </div>
-                    <div class="toggle-contain
+                    <div class="toggle-container">
+                        <div class="toggle-label">Speed 2</div>
+                        <label class="toggle-switch speed2">
+                            <input type="radio" name="speed" value="2" onchange="setSpeed(2)">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <div class="toggle-container">
+                        <div class="toggle-label">Speed 3</div>
+                        <label class="toggle-switch speed3">
+                            <input type="radio" name="speed" value="3" onchange="setSpeed(3)">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div id="recipeSection" class="recipe-section">
+            <div class="card">
+                <h2>Recipe Editor</h2>
+                <div class="recipe-form">
+                    <div class="form-group">
+                        <label for="recipeName">Recipe Name:</label>
+                        <input type="text" id="recipeName" placeholder="Enter recipe name">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Ingredients:</label>
+                        <div class="ingredient-table">
+                            <div class="table-header">
+                                <div>Ingredient Name</div>
+                                <div>Weight (g)</div>
+                                <div>Calories</div>
+                                <div></d
 // ==================== POWER MONITORING FUNCTIONS ====================
 float readVoltage() {
     long sum = 0;
@@ -790,7 +785,8 @@ void onRecipeComplete() {
 
 // ==================== WEB SERVER HANDLERS ====================
 void handleRoot() {
-    server.send(200, "text/html", indexHTML);
+    String html = getCompleteHTML();
+    server.send(200, "text/html", html);
 }
 
 void handleStatus() {
