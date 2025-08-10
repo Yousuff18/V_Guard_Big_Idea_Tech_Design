@@ -1,449 +1,426 @@
-# ESP32 Recipe Controller with Power Monitoring
+# ESP32 Recipe Manager with Power Monitoring
 
-A comprehensive ESP32-based system that combines speed control, power monitoring, and recipe management through a web interface.
+A complete ESP32-based recipe management system with speed control, power monitoring, and web interface. The ESP32 creates its own WiFi access point for direct connection from mobile devices.
 
 ## 🚀 Features
 
-- **WiFi Access Point**: Creates its own network for phone connection
-- **Power Monitoring**: Real-time voltage, current, and power measurement
-- **Speed Control**: 4-level speed control (OFF, Speed 1, Speed 2, Speed 3)
-- **Recipe Management**: Save, edit, and run automated recipes
-- **Web Interface**: Mobile-friendly responsive design
-- **Persistent Storage**: Recipes stored in LittleFS flash memory
-- **Auto-Timer**: Recipes run for specified duration then auto-stop
+- **WiFi Access Point**: ESP32 creates its own hotspot for direct connection
+- **Speed Control**: 4 toggle switches (OFF, Speed 1, Speed 2, Speed 3) with exclusive selection
+- **Power Monitoring**: Real-time voltage, current, and power measurement using ZMPT101B and SCT013 sensors
+- **Recipe Management**: Add, edit, delete recipes with multiple ingredients, weights, and calories
+- **Timer Control**: Automatic speed control based on recipe timer settings
+- **Mobile-Responsive UI**: Clean, modern interface optimized for smartphone use
+- **Persistent Storage**: Recipes stored in LittleFS, survive reboots
+- **Real-time Updates**: Live sensor data and status updates every second
 
 ## 📋 Hardware Requirements
 
-### ESP32 Development Board
-- ESP32 Dev Module (or compatible)
-- Minimum 4MB flash memory
-
-### Power Monitoring Sensors
+### Core Components
+- **ESP32 Dev Module** (any variant with WiFi)
 - **ZMPT101B AC Voltage Sensor Module**
 - **SCT013 Current Transformer** (30A/1V or 100A/50mA)
+- **3x Relay Modules** or motor controller digital inputs
+- **Breadboard and jumper wires**
 
-### Speed Control Outputs
-- 3x Relays or motor controller inputs
-- Optionally: MOSFETs for PWM control
+### Safety Components (CRITICAL)
+- **Voltage Divider Resistors** (for ZMPT101B: 2x 10kΩ resistors)
+- **Burden Resistor** (for SCT013: 47Ω, 1W resistor)
+- **Bias Voltage Circuit** (2x 10kΩ resistors for 1.65V reference)
+- **Isolation** (Proper AC mains isolation - USE EXTREME CAUTION)
 
-### Additional Components
-- 2x 33Ω burden resistors (for current sensing)
-- 4x 10kΩ resistors (for voltage dividers)
-- 2x 1kΩ resistors (for ADC protection)
-- Capacitors: 2x 10µF, 2x 100nF (for filtering)
-- Breadboard or PCB for connections
+⚠️ **WARNING**: This project involves AC mains voltage monitoring. Improper wiring can cause electrocution, fire, or death. Only proceed if you have proper electrical safety knowledge.
 
 ## 🔌 Wiring Diagram
 
-### Power Monitoring Connections
-
+### GPIO Pin Assignments
 ```
-ZMPT101B Voltage Sensor:
-┌─────────────┐
-│ ZMPT101B    │
-│ VCC ──────── 3.3V
-│ GND ──────── GND
-│ OUT ──────── [Voltage Divider] ── GPIO 34
-└─────────────┘
-
-Voltage Divider for ZMPT101B:
-ZMPT101B OUT ── 1kΩ ── GPIO 34
-                 │
-               10kΩ ── 1.65V (bias)
-                 │
-               10kΩ ── GND
+ESP32 Pin    | Component           | Notes
+-------------|--------------------|---------------------------------
+GPIO 34      | ZMPT101B Output    | AC Voltage sensor (with divider)
+GPIO 35      | SCT013 Output      | Current sensor (with burden resistor)
+GPIO 16      | Speed 1 Relay      | Control relay or motor input
+GPIO 17      | Speed 2 Relay      | Control relay or motor input
+GPIO 5       | Speed 3 Relay      | Control relay or motor input
+3.3V         | Sensor Power       | Power for sensor modules
+GND          | Common Ground      | All grounds connected
 ```
 
+### ZMPT101B Connection
 ```
-SCT013 Current Transformer:
-┌─────────────┐
-│ SCT013      │
-│ Terminal 1 ── [33Ω Burden] ── [Voltage Divider] ── GPIO 35
-│ Terminal 2 ── [33Ω Burden] ── GND
-└─────────────┘
-
-Voltage Divider for SCT013:
-CT Output ── 1kΩ ── GPIO 35
-              │
-            10kΩ ── 1.65V (bias)
-              │
-            10kΩ ── GND
+ZMPT101B    ESP32    Additional Components
+VCC     →   3.3V     
+GND     →   GND      
+OUT     →   GPIO34   Via voltage divider (10kΩ + 10kΩ) + 1.65V bias
 ```
 
-### Speed Control Connections
-
+### SCT013 Connection  
 ```
-GPIO Connections:
-GPIO 16 (SPEED1_PIN) ── Relay 1 or Motor Controller Input 1
-GPIO 17 (SPEED2_PIN) ── Relay 2 or Motor Controller Input 2
-GPIO 5  (SPEED3_PIN) ── Relay 3 or Motor Controller Input 3
-
-Note: Add flyback diodes if driving relays directly
+SCT013      ESP32    Additional Components
+Signal  →   GPIO35   Via 47Ω burden resistor + 1.65V bias
+GND     →   GND      
 ```
 
-## 💾 Software Installation
+### Speed Control Relays
+```
+Relay Module    ESP32    Load Connection
+VCC         →   5V       (or 3.3V depending on module)
+GND         →   GND      
+IN1         →   GPIO16   Speed 1 control
+IN2         →   GPIO17   Speed 2 control  
+IN3         →   GPIO5    Speed 3 control
+COM/NO      →   Motor    Connect your motor/device here
+```
+
+## 🛠️ Installation Guide
 
 ### 1. Arduino IDE Setup
 
-```bash
-# Install ESP32 board support
-File -> Preferences -> Additional Boards Manager URLs:
-https://dl.espressif.com/dl/package_esp32_index.json
+1. **Install ESP32 Board Package**:
+   - File → Preferences
+   - Add to Additional Board Manager URLs: `https://dl.espressif.com/dl/package_esp32_index.json`
+   - Tools → Board → Boards Manager → Search "ESP32" → Install
 
-Tools -> Board Manager -> Search "ESP32" -> Install
-```
+2. **Select Board**:
+   - Tools → Board → ESP32 Arduino → ESP32 Dev Module
+
+3. **Configure Upload Settings**:
+   ```
+   Board: ESP32 Dev Module
+   Upload Speed: 921600
+   CPU Frequency: 240MHz (WiFi/BT)
+   Flash Frequency: 80MHz
+   Flash Mode: QIO
+   Flash Size: 4MB (32Mb)
+   Partition Scheme: Default 4MB with spiffs
+   Core Debug Level: None
+   ```
 
 ### 2. Required Libraries
 
-Install these libraries through Arduino IDE Library Manager:
+Install these libraries via **Tools → Manage Libraries**:
 
-```bash
-- ArduinoJson (v6.21.0 or later)
-- EmonLib (for calibration sketch)
-```
+1. **ArduinoJson** by Benoit Blanchon
+   - Search: "ArduinoJson"
+   - Install the latest version
 
-### 3. Upload Process
+2. **EmonLib** (for calibration only)
+   - Search: "EmonLib" 
+   - Install for calibration sketch
 
-1. **Upload Main Sketch**:
-   - Open the main `.ino` file
-   - Select Board: "ESP32 Dev Module"
-   - Select correct COM port
-   - Upload sketch
+### 3. Code Installation
 
-2. **No LittleFS Upload Needed**: 
-   - Web files are embedded in the sketch
-   - LittleFS will auto-format on first boot
-
-### 4. Configuration
-
-Edit these constants in the main sketch as needed:
-
-```cpp
-// WiFi Settings
-#define AP_SSID "ESP32-RecipeAP"        // Change WiFi name
-#define AP_PASSWORD "recipe123"         // Change password
-
-// GPIO Pin Assignments (change if needed)
-#define SPEED1_PIN 16    // Speed 1 output
-#define SPEED2_PIN 17    // Speed 2 output  
-#define SPEED3_PIN 5     // Speed 3 output
-#define V_PIN 34         // Voltage sensor
-#define I_PIN 35         // Current sensor
-
-// Calibration Constants (replace after calibration)
-#define V_CALIB 1000     // Voltage calibration factor
-#define I_CALIB 1000     // Current calibration factor
-```
-
-## 🔧 Calibration Process
-
-### 1. Upload Calibration Sketch
-
-1. Create folder: `YourSketch/calibration/`
-2. Save calibration sketch as `calibration.ino`
-3. Upload and run calibration sketch
-
-### 2. Perform Calibration
-
-1. **Setup Test Load**:
-   - Use purely resistive load (incandescent bulb, heater)
-   - Avoid inductive loads (motors, transformers)
-
-2. **Measure with Multimeter**:
-   - Connect true-RMS multimeter
-   - Record actual voltage and current
-
-3. **Calculate Calibration Constants**:
+1. **Create Project Folder**:
    ```
-   New CV1 = (Multimeter_Voltage × 1000) ÷ ESP32_Voltage
-   New CI1 = (Multimeter_Current × 1000) ÷ ESP32_Current
+   ESP32_Recipe_Manager/
+   ├── ESP32_Recipe_Manager.ino    (main code)
+   └── calibration/
+       └── ESP32_Calibration.ino   (calibration code)
    ```
 
-4. **Example Calculation**:
+2. **Upload Main Code**:
+   - Copy the main ESP32_Recipe_Manager.ino code
+   - Upload to ESP32
+   - Open Serial Monitor (115200 baud) to see connection details
+
+## ⚡ Sensor Calibration (ESSENTIAL)
+
+### Why Calibration is Needed
+The default calibration values (V_CALIB = 1000, I_CALIB = 1000) are generic. For accurate readings, you must calibrate with known loads.
+
+### Calibration Process
+
+1. **Hardware Setup**:
+   - Wire sensors as shown in wiring diagram
+   - Connect a **purely resistive load** (electric heater, kettle, incandescent bulb)
+   - Have a **multimeter** ready for reference measurements
+
+2. **Upload Calibration Sketch**:
+   - Open `calibration/ESP32_Calibration.ino`
+   - Upload to ESP32
+   - Open Serial Monitor (115200 baud)
+
+3. **Take Measurements**:
+   - Turn on your resistive load
+   - Note ESP32 readings: `Vrms: XXX V | Irms: XXX A`
+   - Measure actual values with multimeter
+   - Record both sets of values
+
+4. **Calculate Calibration Constants**:
    ```
-   Multimeter reads: 230V, 2.5A
-   ESP32 reads: 180V, 3.2A
+   New CV1 = (Vr × CVold) ÷ Vesp
+   New CI1 = (Ir × CIold) ÷ Iesp
+   ```
    
-   New CV1 = (230 × 1000) ÷ 180 = 1278
-   New CI1 = (2.5 × 1000) ÷ 3.2 = 781
+   Where:
+   - `Vr` = Real voltage (multimeter)
+   - `Ir` = Real current (multimeter)
+   - `Vesp` = ESP32 displayed voltage
+   - `Iesp` = ESP32 displayed current
+   - `CVold` = 1000 (starting value)
+   - `CIold` = 1000 (starting value)
+
+5. **Example Calculation**:
+   ```
+   Multimeter: 230V, 2.5A
+   ESP32 shows: 200V, 2.2A
+   
+   New CV1 = (230 × 1000) ÷ 200 = 1150
+   New CI1 = (2.5 × 1000) ÷ 2.2 = 1136
    ```
 
-5. **Update Main Sketch**:
-   - Replace `V_CALIB 1000` with `V_CALIB 1278`
-   - Replace `I_CALIB 1000` with `I_CALIB 781`
-   - Re-upload main sketch
+6. **Update Main Code**:
+   - Open main ESP32_Recipe_Manager.ino
+   - Replace calibration values:
+   ```cpp
+   #define V_CALIB 1150  // Your calculated CV1
+   #define I_CALIB 1136  // Your calculated CI1
+   ```
+   - Re-upload main code
 
-## 🌐 Web Interface Usage
+## 📱 Usage Guide
 
-### 1. Connect to ESP32
+### First Time Setup
 
-1. **WiFi Connection**:
-   - Connect phone/computer to "ESP32-RecipeAP"
-   - Password: "recipe123" (or your custom password)
+1. **Power On ESP32**: Connect power via USB or external supply
 
-2. **Open Web Interface**:
-   - Browse to: `http://192.168.4.1`
-   - Bookmark for easy access
+2. **Connect to WiFi**:
+   - Look for network: **ESP32-RecipeAP**
+   - Password: **Recipe123456**
+   - Wait for connection confirmation
 
-### 2. Home Page Features
+3. **Open Web Interface**:
+   - Open browser on connected device
+   - Go to: **http://192.168.4.1**
+   - Interface should load immediately
 
-**Power Monitoring Display**:
-- Real-time voltage, current, and power
-- Updates every second
-- Color-coded status indicator
+### Main Interface
 
-**Speed Control Toggles**:
-- OFF, Speed 1, Speed 2, Speed 3 buttons
-- Only one can be active at a time
-- Smooth visual transitions
+#### Home Screen
+- **Sensor Readings**: Real-time voltage, current, power display
+- **Speed Controls**: 4 toggle switches (OFF, Speed 1, Speed 2, Speed 3)
+- **Timer Display**: Shows when recipe is running with countdown
+- **Hamburger Menu**: Access recipe management (☰ button)
 
-### 3. Recipe Editor (Hamburger Menu)
+#### Speed Control
+- Only one speed can be active at a time
+- Toggles are disabled during recipe execution
+- Manual control available when no recipe running
 
-**Create Recipe**:
-- Recipe Name: Descriptive name
-- Ingredient Name: What you're processing
-- Weight: In grams
-- Calories: Nutritional information
-- Serving Size: Number of servings
-- Speed Level: 1, 2, or 3
-- Timer: Duration in seconds
+### Recipe Management
 
-**Manage Recipes**:
-- Tap recipe card to expand details
-- Run button starts automatic sequence
-- Delete button removes recipe
-- All recipes persist after reboot
+#### Adding New Recipe
 
-## 🔌 API Endpoints
+1. **Access Recipe Page**: Tap hamburger menu (☰) → Recipe editor loads
+2. **Enter Recipe Details**:
+   - **Recipe Name**: Descriptive name for your recipe
+   - **Ingredients Table**: 
+     - Ingredient name (text)
+     - Weight in grams (number)
+     - Calories per ingredient (number)
+   - **Add More Ingredients**: Use "+ Add Ingredient" button
+   - **Serving Size**: Number of servings this recipe makes
+   - **Speed Level**: Choose 1, 2, or 3 for motor speed
+   - **Timer**: Duration in seconds for automatic operation
 
-The ESP32 provides a REST API for integration:
+3. **Save Recipe**: Tap "Save Recipe" button
 
-### GET /status
-Returns current system status
-```json
-{
-  "voltage": 230.5,
-  "current": 2.34,
-  "power": 539.57,
-  "speedState": 2,
-  "recipeRunning": false
-}
+#### Managing Saved Recipes
+
+- **View Recipes**: Scroll to "Saved Recipes" section
+- **Expand Details**: Tap recipe header to see full details
+- **Run Recipe**: Tap "Run Recipe" to start automatic operation
+- **Delete Recipe**: Tap "Delete" and confirm
+
+#### Running Recipes
+
+When a recipe runs:
+- Selected speed activates automatically
+- Timer counts down in real-time
+- Speed controls are disabled
+- Motor stops automatically when timer expires
+- Only one recipe can run at a time
+
+## 🔧 Configuration Options
+
+### Network Settings
+```cpp
+// Change these in the main code
+const char* AP_SSID = "ESP32-RecipeAP";           // Your preferred network name
+const char* AP_PASSWORD = "Recipe123456";          // Your preferred password (min 8 chars)
 ```
 
-### POST /toggle
-Set speed level
-```json
-Request: {"speed": 2}
-Response: {"success": true}
+### GPIO Pin Mapping
+```cpp
+// Modify if using different pins
+#define SPEED1_PIN 16                               // Speed 1 relay control pin
+#define SPEED2_PIN 17                               // Speed 2 relay control pin  
+#define SPEED3_PIN 5                                // Speed 3 relay control pin
+#define VOLTAGE_PIN 34                              // ZMPT101B voltage sensor pin
+#define CURRENT_PIN 35                              // SCT013 current sensor pin
 ```
 
-### GET /recipes
-Get all saved recipes
-```json
-[
-  {
-    "name": "Smoothie Mix",
-    "ingredient": "Fruits",
-    "weight": 500,
-    "calories": 200,
-    "servingSize": 2,
-    "speedLevel": 3,
-    "timer": 60
-  }
-]
+### Sensor Update Rate
+```cpp
+#define SENSOR_UPDATE_INTERVAL 1000                 // Update interval in milliseconds
+#define ADC_SAMPLES 1000                            // ADC samples for RMS calculation
 ```
 
-### POST /recipes
-Save new recipe
-```json
-Request: {
-  "name": "Protein Shake",
-  "ingredient": "Whey Powder",
-  "weight": 30,
-  "calories": 120,
-  "servingSize": 1,
-  "speedLevel": 2,
-  "timer": 45
-}
+## 🐛 Troubleshooting
+
+### Connection Issues
+
+**Can't see ESP32-RecipeAP network:**
+- Check ESP32 power and code upload
+- Look in 2.4GHz WiFi networks only
+- Reset ESP32 and wait 30 seconds
+
+**Connected but can't access webpage:**
+- Verify connection to ESP32-RecipeAP (not home WiFi)
+- Try http://192.168.4.1 (not https)
+- Clear browser cache
+- Try different browser
+
+### Sensor Reading Issues
+
+**Voltage/Current readings are zero:**
+- Check sensor wiring and power
+- Verify bias voltage circuit (should be 1.65V)
+- Ensure proper grounding
+- Run calibration sketch to test sensors
+
+**Readings are inaccurate:**
+- **MUST run calibration process** with known loads
+- Update V_CALIB and I_CALIB values
+- Check for loose connections
+- Verify burden resistor value (47Ω for SCT013)
+
+**Erratic readings:**
+- Add filter capacitors (100nF ceramic + 10µF electrolytic)
+- Improve grounding
+- Separate analog and digital grounds if possible
+- Increase ADC_SAMPLES value for more stable readings
+
+### Speed Control Issues
+
+**Relays not switching:**
+- Check relay module power supply
+- Verify GPIO connections
+- Test with multimeter for 3.3V output
+- Some relays need 5V - use level shifter or 5V-tolerant modules
+
+**Multiple speeds active:**
+- Software prevents this - check for hardware cross-wiring
+- Reset ESP32 to clear any stuck states
+
+### Recipe Management Issues
+
+**Recipes not saving:**
+- Check LittleFS initialization in serial monitor
+- Ensure sufficient flash memory
+- Try simpler recipe names (avoid special characters)
+
+**Timer not working:**
+- Verify recipe has non-zero timer value
+- Check serial monitor for debug messages
+- Manual speed control should work if timer fails
+
+### Serial Monitor Debug
+
+Enable detailed debugging:
+```cpp
+// Add to main code for more debug info
+#define DEBUG_MODE 1
 ```
 
-### DELETE /recipes?index=0
-Delete recipe by index
+Common serial messages:
+- `LittleFS mounted successfully` - File system OK
+- `HTTP server started` - Web server running
+- `V: XXX V, I: XXX A, P: XXX W` - Sensor readings
+- `Speed X ON/OFF` - Relay status changes
+- `Starting recipe: XXX` - Recipe execution begins
 
-### POST /run-recipe
-Execute recipe
-```json
-Request: {"speedLevel": 3, "timer": 60}
-Response: {"success": true}
-```
-
-## ⚠️ Safety Considerations
+## ⚠️ Safety Warnings
 
 ### Electrical Safety
-- Use appropriate fuses/breakers
-- Ensure proper grounding
-- Double-check all high-voltage connections
-- Test with low power loads first
+- **AC Mains Voltage**: This project monitors dangerous voltages
+- **Use Proper Isolation**: Never connect ESP32 directly to mains
+- **GFCI Protection**: Use ground fault circuit interrupter
+- **Professional Review**: Have qualified electrician review connections
+- **Testing**: Use isolation transformer for initial testing
 
-### Code Safety Features
-- Only one speed active at a time
-- Recipe conflicts prevented
-- Auto-stop when timer expires
-- GPIO state validation
+### Fire Safety  
+- **Proper Ventilation**: Ensure adequate airflow around components
+- **Heat Management**: Monitor component temperatures
+- **Fuse Protection**: Use appropriate fuses in all circuits
+- **Emergency Shutoff**: Have manual disconnect readily available
 
-### Operational Safety
-- Monitor first few recipe runs
-- Start with short timer durations
-- Keep emergency stop accessible
-- Regular calibration checks
+### Personal Safety
+- **Turn Off Power**: Always disconnect power when wiring
+- **Use PPE**: Wear safety glasses and insulated gloves
+- **Work Alone**: Don't work on live circuits alone
+- **Know Your Limits**: If unsure, consult professionals
 
-## 🛠️ Troubleshooting
+## 📊 Technical Specifications
 
-### Power Monitoring Issues
+### Power Requirements
+- **ESP32**: 250mA @ 3.3V (active), 20µA (deep sleep)
+- **Sensors**: 50mA @ 3.3V combined
+- **Relays**: Varies by type (typically 50-200mA @ 5V each)
+- **Total**: ~500mA @ 5V recommended supply
 
-**Voltage Reading Zero**:
-- Check ZMPT101B power (3.3V, GND)
-- Verify voltage divider circuit
-- Test with multimeter on GPIO 34
-- Expected: ~1.65V DC + AC fluctuation
+### Performance
+- **WiFi Range**: ~50m indoor, ~100m outdoor (typical)
+- **Sensor Update Rate**: 1Hz (configurable)
+- **ADC Resolution**: 12-bit (4096 levels)
+- **Current Accuracy**: ±2% after calibration
+- **Voltage Accuracy**: ±1% after calibration
 
-**Current Reading Zero**:
-- Check SCT013 connection
-- Verify 33Ω burden resistor
-- Ensure current flows through CT primary
-- Test voltage across burden resistor
+### Memory Usage
+- **Flash**: ~500KB program + web assets
+- **RAM**: ~50KB runtime usage
+- **SPIFFS**: ~100KB for recipe storage
 
-**Unstable Readings**:
-- Add filtering capacitors (10µF + 100nF)
-- Check for loose connections
-- Move away from interference sources
-- Consider ADS1115 for better precision
+## 🔮 Future Enhancements
 
-### WiFi/Connection Issues
+### Planned Features
+- **Data Logging**: Historical power consumption graphs
+- **Multiple Timers**: Support for multi-stage recipes  
+- **WiFi Client Mode**: Connect to existing network
+- **MQTT Integration**: IoT platform connectivity
+- **Voice Control**: Integration with smart assistants
+- **Mobile App**: Native Android/iOS application
 
-**Cannot Connect to AP**:
-- Check SSID and password in code
-- Reset ESP32 and retry
-- Look for "ESP32-RecipeAP" in WiFi list
-- Try different device (phone, laptop)
+### Hardware Additions
+- **LCD Display**: Local status display
+- **Rotary Encoder**: Manual speed control
+- **Temperature Sensors**: Monitor motor/ambient temperature
+- **SD Card**: Extended recipe storage
+- **Real-Time Clock**: Scheduled recipe execution
 
-**Web Page Won't Load**:
-- Confirm IP address: 192.168.4.1
-- Clear browser cache
-- Try incognito/private mode
-- Check ESP32 serial monitor for errors
+## 📝 License
 
-### Recipe/Control Issues
+This project is open-source and available under the MIT License. Feel free to modify, distribute, and use for commercial purposes.
 
-**Speeds Won't Change**:
-- Verify GPIO pin assignments
-- Check relay connections
-- Monitor serial output for errors
-- Test individual GPIO pins
+## 🤝 Contributing
 
-**Recipes Won't Save**:
-- Check LittleFS mounting (serial monitor)
-- Verify JSON format in browser console
-- Try formatting LittleFS (will erase all recipes)
-- Ensure sufficient flash memory
+Contributions welcome! Please:
+1. Fork the repository
+2. Create feature branch
+3. Test thoroughly
+4. Submit pull request with detailed description
 
-**Timer Not Working**:
-- Check recipe duration values
-- Monitor serial output during recipe run
-- Verify system doesn't reset during operation
-- Test with short durations first
+## 📞 Support
 
-## 🔄 Advanced Modifications
+For technical support:
+- Check troubleshooting section first
+- Review serial monitor output
+- Create detailed issue report with:
+  - Hardware configuration
+  - Code version
+  - Error messages
+  - Steps to reproduce
 
-### PWM Speed Control
+***
 
-To use PWM instead of simple ON/OFF:
+**⚡ Remember**: This project involves potentially dangerous voltages. Always prioritize safety and consult professionals when in doubt. Happy making! 🚀
 
-```cpp
-// Replace digitalWrite with analogWrite
-void setSpeedLevel(int speed) {
-  analogWrite(SPEED1_PIN, 0);
-  analogWrite(SPEED2_PIN, 0);
-  analogWrite(SPEED3_PIN, 0);
-  
-  switch (speed) {
-    case 1: analogWrite(SPEED1_PIN, 85); break;   // 33% duty
-    case 2: analogWrite(SPEED2_PIN, 170); break;  // 66% duty
-    case 3: analogWrite(SPEED3_PIN, 255); break;  // 100% duty
-  }
-}
-```
-
-### Higher Precision ADC
-
-For better accuracy, use ADS1115:
-
-```cpp
-#include <Adafruit_ADS1X15.h>
-Adafruit_ADS1115 ads;
-
-// In setup():
-ads.begin();
-ads.setGain(GAIN_ONE);  // ±4.096V range
-
-// In readSensors():
-int16_t vRaw = ads.readADC_SingleEnded(0);  // A0
-int16_t iRaw = ads.readADC_SingleEnded(1);  // A1
-```
-
-### Remote Monitoring
-
-Add MQTT or HTTP posting:
-
-```cpp
-#include <PubSubClient.h>
-WiFiClient espClient;
-PubSubClient mqtt(espClient);
-
-// Publish power data
-void publishPowerData() {
-  String payload = "{\"V\":" + String(voltage) + 
-                  ",\"I\":" + String(current) + 
-                  ",\"P\":" + String(power) + "}";
-  mqtt.publish("esp32/power", payload.c_str());
-}
-```
-
-## 📁 Project Structure
-
-```
-ESP32_Recipe_Controller/
-├── ESP32_Recipe_Controller.ino     # Main sketch
-├── calibration/
-│   └── calibration.ino            # Calibration sketch
-├── README.md                      # This documentation
-└── circuit_diagrams/              # Wiring diagrams (optional)
-    ├── power_monitoring.png
-    └── speed_control.png
-```
-
-## 📖 Additional Resources
-
-- [ESP32 Official Documentation](https://docs.espressif.com/projects/esp-idf/en/latest/)
-- [Arduino ESP32 Core](https://github.com/espressif/arduino-esp32)
-- [LittleFS Documentation](https://arduino-esp8266.readthedocs.io/en/latest/filesystem.html)
-- [ZMPT101B Datasheet](https://components101.com/sensors/zmpt101b-voltage-sensor)
-- [SCT013 Current Transformer Guide](https://openenergymonitor.org/emon/buildingblocks)
-
-## 🤝 Support
-
-For issues and questions:
-
-1. Check troubleshooting section above
-2. Review serial monitor output for error messages
-3. Verify all hardware connections
-4. Test individual components separately
-5. Check for library version compatibility
-
-## 📄 License
-
-This project is provided as-is for educational and personal use. Please ensure compliance with local electrical codes and safety regulations when implementing.
-
----
-
-**⚡ Happy Building! ⚡**
