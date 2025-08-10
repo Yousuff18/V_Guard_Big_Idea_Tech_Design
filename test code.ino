@@ -705,9 +705,7 @@ String getMainPage() {
         </div>
         
         <div class="content">
-            <!-- Main Control Page -->
             <div id="mainPage">
-                <!-- Sensor Readings -->
                 <div class="sensor-grid">
                     <div class="sensor-card">
                         <div class="sensor-value" id="voltage">0.0</div>
@@ -723,6 +721,346 @@ String getMainPage() {
                     </div>
                 </div>
                 
-                <!-- Timer Display (shown when recipe is running) -->
                 <div id="timerDisplay" class="timer-display hidden">
-                    <div>Recipe Running: <span id="runningRecipeName"></
+                    <div>Recipe Running: <span id="runningRecipeName"></span></div>
+                    <div>Time Remaining: <span id="remainingTime">0</span>s</div>
+                </div>
+                
+                <div class="speed-controls">
+                    <h3 style="margin-bottom: 15px;">Speed Control</h3>
+                    <div class="speed-grid">
+                        <div class="toggle-switch">
+                            <input type="radio" id="speedOff" name="speed" value="0" checked>
+                            <label for="speedOff" class="toggle-label">OFF</label>
+                        </div>
+                        <div class="toggle-switch">
+                            <input type="radio" id="speed1" name="speed" value="1">
+                            <label for="speed1" class="toggle-label">Speed 1</label>
+                        </div>
+                        <div class="toggle-switch">
+                            <input type="radio" id="speed2" name="speed" value="2">
+                            <label for="speed2" class="toggle-label">Speed 2</label>
+                        </div>
+                        <div class="toggle-switch">
+                            <input type="radio" id="speed3" name="speed" value="3">
+                            <label for="speed3" class="toggle-label">Speed 3</label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div id="recipePage" class="recipes-section">
+                <button class="back-btn" onclick="toggleView()">← Back to Controls</button>
+                
+                <div class="recipe-form">
+                    <h3 style="margin-bottom: 15px;">Add New Recipe</h3>
+                    
+                    <div class="form-group">
+                        <label for="recipeName">Recipe Name:</label>
+                        <input type="text" id="recipeName" placeholder="Enter recipe name">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Ingredients:</label>
+                        <div class="ingredients-table">
+                            <div class="table-header">
+                                <div>Ingredient</div>
+                                <div>Weight (g)</div>
+                                <div>Calories</div>
+                            </div>
+                            <div id="ingredientsContainer">
+                                <div class="ingredient-row">
+                                    <input type="text" placeholder="Ingredient name" class="ingredient-name">
+                                    <input type="number" placeholder="0" class="ingredient-weight">
+                                    <input type="number" placeholder="0" class="ingredient-calories">
+                                </div>
+                            </div>
+                        </div>
+                        <button class="add-ingredient-btn" onclick="addIngredientRow()">+ Add Ingredient</button>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="servingSize">Serving Size:</label>
+                        <input type="number" id="servingSize" placeholder="Enter serving size">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="speedLevel">Speed Level:</label>
+                        <select id="speedLevel">
+                            <option value="1">Speed 1</option>
+                            <option value="2">Speed 2</option>
+                            <option value="3">Speed 3</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="timer">Timer (seconds):</label>
+                        <input type="number" id="timer" placeholder="Enter time in seconds">
+                    </div>
+                    
+                    <button class="btn" onclick="saveRecipe()">Save Recipe</button>
+                </div>
+                
+                <div id="savedRecipes">
+                    <h3 style="margin-bottom: 15px;">Saved Recipes</h3>
+                    <div id="recipesList"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentView = 'main';
+        let statusUpdateInterval;
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            updateStatus();
+            statusUpdateInterval = setInterval(updateStatus, 1000);
+            loadRecipes();
+            
+            document.querySelectorAll('input[name="speed"]').forEach(radio => {
+                radio.addEventListener('change', function() {
+                    if (!this.disabled) {
+                        setSpeed(parseInt(this.value));
+                    }
+                });
+            });
+        });
+        
+        function toggleView() {
+            const mainPage = document.getElementById('mainPage');
+            const recipePage = document.getElementById('recipePage');
+            
+            if (currentView === 'main') {
+                mainPage.style.display = 'none';
+                recipePage.style.display = 'block';
+                currentView = 'recipe';
+                loadRecipes();
+            } else {
+                mainPage.style.display = 'block';
+                recipePage.style.display = 'none';
+                currentView = 'main';
+            }
+        }
+        
+        async function updateStatus() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+                
+                document.getElementById('voltage').textContent = data.voltage.toFixed(1);
+                document.getElementById('current').textContent = data.current.toFixed(2);
+                document.getElementById('power').textContent = data.power.toFixed(1);
+                
+                const speedRadios = document.querySelectorAll('input[name="speed"]');
+                speedRadios.forEach(radio => {
+                    radio.checked = (parseInt(radio.value) === data.speedState);
+                    radio.disabled = data.recipeRunning;
+                });
+                
+                const timerDisplay = document.getElementById('timerDisplay');
+                if (data.recipeRunning) {
+                    timerDisplay.classList.remove('hidden');
+                    document.getElementById('runningRecipeName').textContent = data.runningRecipe;
+                    document.getElementById('remainingTime').textContent = data.remainingTime || 0;
+                } else {
+                    timerDisplay.classList.add('hidden');
+                }
+                
+            } catch (error) {
+                console.error('Error updating status:', error);
+            }
+        }
+        
+        async function setSpeed(speed) {
+            try {
+                const response = await fetch('/toggle', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: 'speed=' + speed
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    alert(error.error || 'Failed to set speed');
+                }
+            } catch (error) {
+                console.error('Error setting speed:', error);
+                alert('Failed to communicate with device');
+            }
+        }
+        
+        function addIngredientRow() {
+            const container = document.getElementById('ingredientsContainer');
+            const newRow = document.createElement('div');
+            newRow.className = 'ingredient-row';
+            newRow.innerHTML = '<input type="text" placeholder="Ingredient name" class="ingredient-name"><input type="number" placeholder="0" class="ingredient-weight"><input type="number" placeholder="0" class="ingredient-calories">';
+            container.appendChild(newRow);
+        }
+        
+        async function saveRecipe() {
+            const recipeName = document.getElementById('recipeName').value.trim();
+            if (!recipeName) {
+                alert('Please enter a recipe name');
+                return;
+            }
+            
+            const ingredients = [];
+            const ingredientRows = document.querySelectorAll('.ingredient-row');
+            
+            ingredientRows.forEach(row => {
+                const name = row.querySelector('.ingredient-name').value.trim();
+                const weight = parseFloat(row.querySelector('.ingredient-weight').value) || 0;
+                const calories = parseFloat(row.querySelector('.ingredient-calories').value) || 0;
+                
+                if (name) {
+                    ingredients.push({
+                        name: name,
+                        weight: weight,
+                        calories: calories
+                    });
+                }
+            });
+            
+            if (ingredients.length === 0) {
+                alert('Please add at least one ingredient');
+                return;
+            }
+            
+            const servingSize = parseFloat(document.getElementById('servingSize').value) || 1;
+            const speedLevel = parseInt(document.getElementById('speedLevel').value);
+            const timer = parseInt(document.getElementById('timer').value) || 0;
+            
+            const recipe = {
+                recipeName: recipeName,
+                ingredients: ingredients,
+                servingSize: servingSize,
+                speedLevel: speedLevel,
+                timer: timer
+            };
+            
+            try {
+                const response = await fetch('/recipes', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(recipe)
+                });
+                
+                if (response.ok) {
+                    alert('Recipe saved successfully!');
+                    clearRecipeForm();
+                    loadRecipes();
+                } else {
+                    const error = await response.json();
+                    alert(error.error || 'Failed to save recipe');
+                }
+            } catch (error) {
+                console.error('Error saving recipe:', error);
+                alert('Failed to save recipe');
+            }
+        }
+        
+        function clearRecipeForm() {
+            document.getElementById('recipeName').value = '';
+            document.getElementById('servingSize').value = '';
+            document.getElementById('timer').value = '';
+            
+            const container = document.getElementById('ingredientsContainer');
+            const firstRow = container.querySelector('.ingredient-row');
+            container.innerHTML = '';
+            container.appendChild(firstRow);
+            
+            firstRow.querySelectorAll('input').forEach(input => input.value = '');
+        }
+        
+        async function loadRecipes() {
+            try {
+                const response = await fetch('/recipes');
+                const recipes = await response.json();
+                
+                const recipesList = document.getElementById('recipesList');
+                recipesList.innerHTML = '';
+                
+                recipes.forEach(recipe => {
+                    const totalCalories = recipe.ingredients.reduce((sum, ing) => sum + ing.calories, 0);
+                    
+                    const recipeCard = document.createElement('div');
+                    recipeCard.className = 'recipe-card';
+                    recipeCard.innerHTML = '<div class="recipe-header" onclick="toggleRecipeDetails(\'' + recipe.recipeName + '\')"><div><div class="recipe-title">' + recipe.recipeName + '</div><div class="recipe-info">Total Calories: ' + totalCalories + '</div></div><div>▼</div></div><div class="recipe-details" id="details-' + recipe.recipeName + '"><div><strong>Ingredients:</strong></div>' + recipe.ingredients.map(ing => '<div>• ' + ing.name + ': ' + ing.weight + 'g (' + ing.calories + ' cal)</div>').join('') + '<div style="margin-top: 10px;"><strong>Serving Size:</strong> ' + recipe.servingSize + '</div><div><strong>Speed Level:</strong> ' + recipe.speedLevel + '</div><div><strong>Timer:</strong> ' + recipe.timer + ' seconds</div><div class="recipe-actions"><button class="btn" onclick="runRecipe(\'' + recipe.recipeName + '\', ' + recipe.speedLevel + ', ' + recipe.timer + ')">Run Recipe</button><button class="btn btn-danger" onclick="deleteRecipe(\'' + recipe.recipeName + '\')">Delete</button></div></div>';
+                    recipesList.appendChild(recipeCard);
+                });
+                
+                if (recipes.length === 0) {
+                    recipesList.innerHTML = '<p style="text-align: center; color: #666;">No recipes saved yet</p>';
+                }
+            } catch (error) {
+                console.error('Error loading recipes:', error);
+            }
+        }
+        
+        function toggleRecipeDetails(recipeName) {
+            const details = document.getElementById('details-' + recipeName);
+            const isVisible = details.style.display === 'block';
+            details.style.display = isVisible ? 'none' : 'block';
+        }
+        
+        async function runRecipe(recipeName, speedLevel, timer) {
+            try {
+                const response = await fetch('/run-recipe', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        recipeName: recipeName,
+                        speed: speedLevel,
+                        timer: timer
+                    })
+                });
+                
+                if (response.ok) {
+                    alert('Started recipe: ' + recipeName);
+                    if (currentView === 'recipe') {
+                        toggleView();
+                    }
+                } else {
+                    const error = await response.json();
+                    alert(error.error || 'Failed to start recipe');
+                }
+            } catch (error) {
+                console.error('Error running recipe:', error);
+                alert('Failed to start recipe');
+            }
+        }
+        
+        async function deleteRecipe(recipeName) {
+            if (!confirm('Are you sure you want to delete "' + recipeName + '"?')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/recipes?name=' + encodeURIComponent(recipeName), {
+                    method: 'DELETE'
+                });
+                
+                if (response.ok) {
+                    alert('Recipe deleted successfully');
+                    loadRecipes();
+                } else {
+                    const error = await response.json();
+                    alert(error.error || 'Failed to delete recipe');
+                }
+            } catch (error) {
+                console.error('Error deleting recipe:', error);
+                alert('Failed to delete recipe');
+            }
+        }
+    </script>
+</body>
+</html>
+)rawliteral";
+}
