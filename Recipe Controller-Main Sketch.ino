@@ -1,771 +1,77 @@
 /*
- * ESP32 Recipe Controller with Power Monitoring
+ * ESP32 Recipe Manager with Speed Control and Power Monitoring
  * 
- * HARDWARE SETUP:
- * ===============
- * SPEED CONTROL PINS:
- * - GPIO 16 (SPEED1_PIN) -> Relay 1 or Motor Controller Input 1
- * - GPIO 17 (SPEED2_PIN) -> Relay 2 or Motor Controller Input 2
- * - GPIO 5  (SPEED3_PIN) -> Relay 3 or Motor Controller Input 3
+ * Hardware Setup:
+ * - ESP32 Dev Module
+ * - ZMPT101B AC Voltage sensor on GPIO 34 (requires voltage divider for safety)
+ * - SCT013 Current Transformer on GPIO 35 (requires burden resistor ~47Ω)
+ * - Speed control relays on GPIOs 16, 17, 5
  * 
- * POWER MONITORING:
- * - GPIO 34 (V_PIN) -> ZMPT101B voltage sensor output
- *   * Connect ZMPT101B VCC to 3.3V, GND to GND
- *   * Add 10kΩ + 10kΩ voltage divider for 1.65V bias (mid-rail)
- *   * Connect sensor output through 1kΩ resistor to GPIO 34
+ * IMPORTANT CALIBRATION:
+ * 1. Run the calibration sketch first with a purely resistive load
+ * 2. Replace V_CALIB and I_CALIB values below with calibrated values
+ * 3. For better accuracy, consider using ADS1115 ADC module
  * 
- * - GPIO 35 (I_PIN) -> SCT013 current transformer
- *   * Use 33Ω burden resistor across SCT013 output
- *   * Add 10kΩ + 10kΩ voltage divider for 1.65V bias
- *   * Connect CT output through bias network to GPIO 35
- * 
- * CALIBRATION:
- * ============
- * 1. Upload and run the calibration sketch first
- * 2. Use a purely resistive load (incandescent bulb, heater)
- * 3. Measure actual voltage/current with multimeter
- * 4. Calculate: New CV1 = (Vreal * 1000) / Vesp32
- * 5. Calculate: New CI1 = (Ireal * 1000) / Iesp32
- * 6. Replace V_CALIB and I_CALIB values below
- * 
- * DEPLOYMENT:
- * ===========
- * 1. Install LittleFS plugin for Arduino IDE
- * 2. Create 'data' folder in sketch directory
- * 3. Files will be embedded in code (no separate upload needed)
- * 4. Connect to WiFi: SSID "ESP32-RecipeAP", Password "recipe123"
- * 5. Browse to 192.168.4.1
- * 
- * NOTE: For higher precision, consider ADS1115 16-bit ADC module
+ * ADC Setup Notes:
+ * - ZMPT101B: Connect output through voltage divider (1:1) with 1.65V bias
+ * - SCT013: Connect through burden resistor (47Ω) with 1.65V bias
+ * - Both sensors require proper AC coupling and bias voltage at ESP32 ADC mid-point
  */
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
-#include <Ticker.h>
 
-// ==================== CONFIGURATION ====================
-// WiFi Access Point Settings (CHANGE THESE AS NEEDED)
-#define AP_SSID "ESP32-RecipeAP"
-#define AP_PASSWORD "recipe123"  // Change this password!
+// ========== CONFIGURATION SECTION - MODIFY THESE VALUES ==========
 
-// GPIO Pin Assignments (SAFE DEFAULTS - change if needed)
-#define SPEED1_PIN 16    // Speed 1 relay/output
-#define SPEED2_PIN 17    // Speed 2 relay/output  
-#define SPEED3_PIN 5     // Speed 3 relay/output
-#define V_PIN 34         // ZMPT101B voltage sensor (ADC1_CH6)
-#define I_PIN 35         // SCT013 current sensor (ADC1_CH7)
+// Network Configuration
+const char* AP_SSID = "ESP32-RecipeAP";           // Change this to your preferred SSID
+const char* AP_PASSWORD = "Recipe123456";          // Change this to your preferred password (min 8 chars)
 
-// Calibration Constants (REPLACE AFTER CALIBRATION!)
-#define V_CALIB 1000     // Replace with CV1 from calibration
-#define I_CALIB 1000     // Replace with CI1 from calibration
+// GPIO Pin Configuration - Change these if using different pins
+#define SPEED1_PIN 16                               // Speed 1 relay control pin
+#define SPEED2_PIN 17                               // Speed 2 relay control pin  
+#define SPEED3_PIN 5                                // Speed 3 relay control pin
 
-// System Settings
-#define UPDATE_INTERVAL 1000  // Sensor reading interval (ms)
-#define SAMPLES 100           // Number of ADC samples for RMS
-#define ADC_BITS 12          // ESP32 ADC resolution
-#define ADC_MAX 4095         // Maximum ADC value
-#define VREF 3.3             // Reference voltage
+// Sensor Pin Configuration
+#define VOLTAGE_PIN 34                              // ZMPT101B voltage sensor pin
+#define CURRENT_PIN 35                              // SCT013 current sensor pin
 
-// ==================== GLOBAL VARIABLES ====================
+// Calibration Constants - REPLACE WITH VALUES FROM CALIBRATION SKETCH
+#define V_CALIB 1000                                // Replace with CV1 after calibration
+#define I_CALIB 1000                                // Replace with CI1 after calibration
+
+// Timing Configuration
+#define SENSOR_UPDATE_INTERVAL 1000                 // Sensor reading interval in ms
+#define ADC_SAMPLES 1000                            // Number of ADC samples for RMS calculation
+
+// ========== END CONFIGURATION SECTION ==========
+
+// Web server and global variables
 WebServer server(80);
-Ticker sensorTicker;
-Ticker recipeTimer;
+unsigned long lastSensorUpdate = 0;
+unsigned long recipeEndTime = 0;
+bool recipeRunning = false;
+String runningRecipeName = "";
+int currentSpeed = 0; // 0=OFF, 1=Speed1, 2=Speed2, 3=Speed3
 
-// Power monitoring variables
+// Sensor variables
 float voltage = 0.0;
 float current = 0.0;
 float power = 0.0;
 
-// Speed control state (0=OFF, 1=SPEED1, 2=SPEED2, 3=SPEED3)
-int currentSpeed = 0;
-
-// Recipe execution state
-bool recipeRunning = false;
+// Recipe timer variables
 unsigned long recipeStartTime = 0;
-unsigned long recipeDuration = 0;
-int recipeSpeed = 0;
+unsigned int recipeTimerSeconds = 0;
 
-// ==================== EMBEDDED WEB FILES ====================
-const char* indexHTML = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32 Recipe Controller</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            color: #333;
-        }
-        
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        
-        .header {
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 15px;
-            padding: 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37);
-            backdrop-filter: blur(4px);
-            border: 1px solid rgba(255, 255, 255, 0.18);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        
-        .hamburger {
-            cursor: pointer;
-            padding: 10px;
-            border-radius: 8px;
-            transition: background 0.3s;
-        }
-        
-        .hamburger:hover {
-            background: rgba(0, 0, 0, 0.1);
-        }
-        
-        .hamburger span {
-            display: block;
-            width: 25px;
-            height: 3px;
-            background: #333;
-            margin: 5px 0;
-            transition: 0.3s;
-        }
-        
-        .card {
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 15px;
-            padding: 25px;
-            margin-bottom: 20px;
-            box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37);
-            backdrop-filter: blur(4px);
-            border: 1px solid rgba(255, 255, 255, 0.18);
-        }
-        
-        .power-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-        
-        .power-item {
-            text-align: center;
-            padding: 15px;
-            background: linear-gradient(45deg, #f0f2f5, #e1e8ed);
-            border-radius: 10px;
-            border: 2px solid transparent;
-            transition: all 0.3s ease;
-        }
-        
-        .power-item:hover {
-            border-color: #667eea;
-            transform: translateY(-2px);
-        }
-        
-        .power-value {
-            font-size: 1.8em;
-            font-weight: bold;
-            color: #667eea;
-            margin-bottom: 5px;
-        }
-        
-        .power-label {
-            font-size: 0.9em;
-            color: #666;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        
-        .speed-controls {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-            gap: 15px;
-        }
-        
-        .speed-toggle {
-            padding: 15px;
-            border: none;
-            border-radius: 10px;
-            cursor: pointer;
-            font-size: 1.1em;
-            font-weight: bold;
-            transition: all 0.3s ease;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        
-        .speed-toggle.off {
-            background: linear-gradient(45deg, #ff6b6b, #ee5a5a);
-            color: white;
-        }
-        
-        .speed-toggle.speed1 {
-            background: linear-gradient(45deg, #4ecdc4, #44a08d);
-            color: white;
-        }
-        
-        .speed-toggle.speed2 {
-            background: linear-gradient(45deg, #45b7d1, #96c93d);
-            color: white;
-        }
-        
-        .speed-toggle.speed3 {
-            background: linear-gradient(45deg, #f093fb, #f5576c);
-            color: white;
-        }
-        
-        .speed-toggle:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.2);
-        }
-        
-        .speed-toggle.active {
-            transform: scale(1.05);
-            box-shadow: 0 0 20px rgba(102, 126, 234, 0.6);
-        }
-        
-        .recipe-section {
-            display: none;
-            animation: fadeIn 0.5s ease-in-out;
-        }
-        
-        .recipe-section.show {
-            display: block;
-        }
-        
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        
-        .recipe-form {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-        }
-        
-        .form-group {
-            margin-bottom: 15px;
-        }
-        
-        .form-group label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: bold;
-            color: #333;
-        }
-        
-        .form-group input, .form-group select {
-            width: 100%;
-            padding: 10px;
-            border: 2px solid #ddd;
-            border-radius: 8px;
-            font-size: 1em;
-            transition: border-color 0.3s;
-        }
-        
-        .form-group input:focus, .form-group select:focus {
-            border-color: #667eea;
-            outline: none;
-        }
-        
-        .btn {
-            background: linear-gradient(45deg, #667eea, #764ba2);
-            color: white;
-            border: none;
-            padding: 12px 24px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 1em;
-            font-weight: bold;
-            transition: all 0.3s ease;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4);
-        }
-        
-        .btn-danger {
-            background: linear-gradient(45deg, #ff6b6b, #ee5a5a);
-        }
-        
-        .recipe-tabs {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 15px;
-            margin-top: 20px;
-        }
-        
-        .recipe-tab {
-            background: linear-gradient(45deg, #e3f2fd, #bbdefb);
-            border-radius: 10px;
-            padding: 20px;
-            border: 2px solid transparent;
-            transition: all 0.3s ease;
-        }
-        
-        .recipe-tab:hover {
-            border-color: #667eea;
-            transform: translateY(-2px);
-        }
-        
-        .recipe-name {
-            font-size: 1.3em;
-            font-weight: bold;
-            margin-bottom: 10px;
-            color: #1976d2;
-        }
-        
-        .recipe-details {
-            margin-top: 15px;
-            padding-top: 15px;
-            border-top: 1px solid #ccc;
-            display: none;
-        }
-        
-        .recipe-details.show {
-            display: block;
-        }
-        
-        .loading {
-            display: none;
-            text-align: center;
-            padding: 20px;
-        }
-        
-        .spinner {
-            border: 4px solid #f3f3f3;
-            border-top: 4px solid #667eea;
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-            margin: 0 auto 10px;
-        }
-        
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-        
-        .status-indicator {
-            display: inline-block;
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            margin-left: 10px;
-        }
-        
-        .status-indicator.running {
-            background: #4caf50;
-            animation: pulse 1.5s infinite;
-        }
-        
-        .status-indicator.stopped {
-            background: #f44336;
-        }
-        
-        @keyframes pulse {
-            0% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7); }
-            70% { box-shadow: 0 0 0 10px rgba(76, 175, 80, 0); }
-            100% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0); }
-        }
-        
-        @media (max-width: 768px) {
-            .container {
-                padding: 10px;
-            }
-            
-            .power-grid {
-                grid-template-columns: 1fr 1fr;
-            }
-            
-            .speed-controls {
-                grid-template-columns: 1fr 1fr;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>Recipe Controller</h1>
-            <div class="hamburger" onclick="toggleMenu()">
-                <span></span>
-                <span></span>
-                <span></span>
-            </div>
-        </div>
-        
-        <div id="homeSection">
-            <div class="card">
-                <h2>Power Monitoring</h2>
-                <div class="power-grid">
-                    <div class="power-item">
-                        <div class="power-value" id="voltage">0.0</div>
-                        <div class="power-label">Voltage (V)</div>
-                    </div>
-                    <div class="power-item">
-                        <div class="power-value" id="current">0.0</div>
-                        <div class="power-label">Current (A)</div>
-                    </div>
-                    <div class="power-item">
-                        <div class="power-value" id="power">0.0</div>
-                        <div class="power-label">Power (W)</div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="card">
-                <h2>Speed Control <span class="status-indicator" id="statusIndicator"></span></h2>
-                <div class="speed-controls">
-                    <button class="speed-toggle off active" onclick="setSpeed(0)">OFF</button>
-                    <button class="speed-toggle speed1" onclick="setSpeed(1)">Speed 1</button>
-                    <button class="speed-toggle speed2" onclick="setSpeed(2)">Speed 2</button>
-                    <button class="speed-toggle speed3" onclick="setSpeed(3)">Speed 3</button>
-                </div>
-            </div>
-        </div>
-        
-        <div id="recipeSection" class="recipe-section">
-            <div class="card">
-                <h2>Recipe Editor</h2>
-                <div class="recipe-form">
-                    <div class="form-group">
-                        <label for="recipeName">Recipe Name:</label>
-                        <input type="text" id="recipeName" placeholder="Enter recipe name">
-                    </div>
-                    <div class="form-group">
-                        <label for="ingredientName">Ingredient Name:</label>
-                        <input type="text" id="ingredientName" placeholder="Enter ingredient name">
-                    </div>
-                    <div class="form-group">
-                        <label for="weight">Weight (g):</label>
-                        <input type="number" id="weight" placeholder="Enter weight">
-                    </div>
-                    <div class="form-group">
-                        <label for="calories">Calories:</label>
-                        <input type="number" id="calories" placeholder="Enter calories">
-                    </div>
-                    <div class="form-group">
-                        <label for="servingSize">Serving Size:</label>
-                        <input type="number" id="servingSize" placeholder="Enter serving size">
-                    </div>
-                    <div class="form-group">
-                        <label for="speedLevel">Speed Level:</label>
-                        <select id="speedLevel">
-                            <option value="1">Speed 1</option>
-                            <option value="2">Speed 2</option>
-                            <option value="3">Speed 3</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label for="timer">Timer (seconds):</label>
-                        <input type="number" id="timer" placeholder="Enter timer in seconds">
-                    </div>
-                    <button class="btn" onclick="saveRecipe()">Save Recipe</button>
-                </div>
-                
-                <div class="recipe-tabs" id="recipeTabs">
-                    <!-- Recipe tabs will be populated here -->
-                </div>
-            </div>
-        </div>
-        
-        <div class="loading" id="loading">
-            <div class="spinner"></div>
-            <div>Loading...</div>
-        </div>
-    </div>
-<script>
-        let currentSpeedState = 0;
-        let recipeRunning = false;
-        let menuOpen = false;
-        
-        // Initialize the application
-        document.addEventListener('DOMContentLoaded', function() {
-            updateStatus();
-            loadRecipes();
-            setInterval(updateStatus, 1000);
-        });
-        
-        // Toggle hamburger menu
-        function toggleMenu() {
-            menuOpen = !menuOpen;
-            const homeSection = document.getElementById('homeSection');
-            const recipeSection = document.getElementById('recipeSection');
-            
-            if (menuOpen) {
-                homeSection.style.display = 'none';
-                recipeSection.classList.add('show');
-            } else {
-                homeSection.style.display = 'block';
-                recipeSection.classList.remove('show');
-            }
-        }
-        
-        // Update power monitoring and status
-        async function updateStatus() {
-            try {
-                const response = await fetch('/status');
-                const data = await response.json();
-                
-                document.getElementById('voltage').textContent = data.voltage.toFixed(1);
-                document.getElementById('current').textContent = data.current.toFixed(2);
-                document.getElementById('power').textContent = data.power.toFixed(1);
-                
-                currentSpeedState = data.speedState;
-                updateSpeedButtons();
-                
-                const indicator = document.getElementById('statusIndicator');
-                if (data.speedState > 0) {
-                    indicator.className = 'status-indicator running';
-                } else {
-                    indicator.className = 'status-indicator stopped';
-                }
-                
-            } catch (error) {
-                console.error('Error updating status:', error);
-            }
-        }
-        
-        // Update speed button states
-        function updateSpeedButtons() {
-            const buttons = document.querySelectorAll('.speed-toggle');
-            buttons.forEach((button, index) => {
-                button.classList.remove('active');
-                if (index === currentSpeedState) {
-                    button.classList.add('active');
-                }
-            });
-        }
-        
-        // Set speed level
-        async function setSpeed(speed) {
-            if (recipeRunning) {
-                alert('Cannot change speed while recipe is running!');
-                return;
-            }
-            
-            showLoading(true);
-            try {
-                const response = await fetch('/toggle', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ speed: speed })
-                });
-                
-                if (response.ok) {
-                    updateStatus();
-                } else {
-                    alert('Error setting speed');
-                }
-            } catch (error) {
-                console.error('Error setting speed:', error);
-                alert('Error setting speed');
-            }
-            showLoading(false);
-        }
-        
-        // Save recipe
-        async function saveRecipe() {
-            const recipe = {
-                name: document.getElementById('recipeName').value,
-                ingredient: document.getElementById('ingredientName').value,
-                weight: parseFloat(document.getElementById('weight').value) || 0,
-                calories: parseInt(document.getElementById('calories').value) || 0,
-                servingSize: parseInt(document.getElementById('servingSize').value) || 1,
-                speedLevel: parseInt(document.getElementById('speedLevel').value),
-                timer: parseInt(document.getElementById('timer').value) || 0
-            };
-            
-            if (!recipe.name || !recipe.ingredient) {
-                alert('Please enter recipe name and ingredient name');
-                return;
-            }
-            
-            showLoading(true);
-            try {
-                const response = await fetch('/recipes', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(recipe)
-                });
-                
-                if (response.ok) {
-                    // Clear form
-                    document.getElementById('recipeName').value = '';
-                    document.getElementById('ingredientName').value = '';
-                    document.getElementById('weight').value = '';
-                    document.getElementById('calories').value = '';
-                    document.getElementById('servingSize').value = '';
-                    document.getElementById('timer').value = '';
-                    
-                    loadRecipes();
-                    alert('Recipe saved successfully!');
-                } else {
-                    alert('Error saving recipe');
-                }
-            } catch (error) {
-                console.error('Error saving recipe:', error);
-                alert('Error saving recipe');
-            }
-            showLoading(false);
-        }
-        
-        // Load recipes
-        async function loadRecipes() {
-            try {
-                const response = await fetch('/recipes');
-                const recipes = await response.json();
-                
-                const tabsContainer = document.getElementById('recipeTabs');
-                tabsContainer.innerHTML = '';
-                
-                recipes.forEach((recipe, index) => {
-                    const tab = document.createElement('div');
-                    tab.className = 'recipe-tab';
-                    tab.innerHTML = `
-                        <div class="recipe-name">${recipe.name}</div>
-                        <div>
-                            <button class="btn" onclick="runRecipe(${index})" id="runBtn${index}">Run</button>
-                            <button class="btn btn-danger" onclick="deleteRecipe(${index})" style="margin-left: 10px;">Delete</button>
-                        </div>
-                        <div class="recipe-details" id="details${index}">
-                            <p><strong>Ingredient:</strong> ${recipe.ingredient}</p>
-                            <p><strong>Weight:</strong> ${recipe.weight}g</p>
-                            <p><strong>Calories:</strong> ${recipe.calories}</p>
-                            <p><strong>Serving Size:</strong> ${recipe.servingSize}</p>
-                            <p><strong>Speed Level:</strong> ${recipe.speedLevel}</p>
-                            <p><strong>Timer:</strong> ${recipe.timer}s</p>
-                        </div>
-                    `;
-                    
-                    tab.onclick = (e) => {
-                        if (e.target.tagName !== 'BUTTON') {
-                            const details = document.getElementById(`details${index}`);
-                            details.classList.toggle('show');
-                        }
-                    };
-                    
-                    tabsContainer.appendChild(tab);
-                });
-            } catch (error) {
-                console.error('Error loading recipes:', error);
-            }
-        }
-        
-        // Run recipe
-        async function runRecipe(index) {
-            if (recipeRunning) {
-                alert('Another recipe is already running!');
-                return;
-            }
-            
-            showLoading(true);
-            try {
-                const response = await fetch('/recipes');
-                const recipes = await response.json();
-                const recipe = recipes[index];
-                
-                const runResponse = await fetch('/run-recipe', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ 
-                        speedLevel: recipe.speedLevel, 
-                        timer: recipe.timer 
-                    })
-                });
-                
-                if (runResponse.ok) {
-                    recipeRunning = true;
-                    document.getElementById(`runBtn${index}`).textContent = 'Running...';
-                    document.getElementById(`runBtn${index}`).disabled = true;
-                    
-                    setTimeout(() => {
-                        recipeRunning = false;
-                        document.getElementById(`runBtn${index}`).textContent = 'Run';
-                        document.getElementById(`runBtn${index}`).disabled = false;
-                        alert('Recipe completed!');
-                    }, recipe.timer * 1000);
-                } else {
-                    alert('Error running recipe');
-                }
-            } catch (error) {
-                console.error('Error running recipe:', error);
-                alert('Error running recipe');
-            }
-            showLoading(false);
-        }
-        
-        // Delete recipe
-        async function deleteRecipe(index) {
-            if (!confirm('Are you sure you want to delete this recipe?')) {
-                return;
-            }
-            
-            showLoading(true);
-            try {
-                const response = await fetch(`/recipes?index=${index}`, {
-                    method: 'DELETE'
-                });
-                
-                if (response.ok) {
-                    loadRecipes();
-                    alert('Recipe deleted successfully!');
-                } else {
-                    alert('Error deleting recipe');
-                }
-            } catch (error) {
-                console.error('Error deleting recipe:', error);
-                alert('Error deleting recipe');
-            }
-            showLoading(false);
-        }
-        
-        // Show/hide loading spinner
-        function showLoading(show) {
-            document.getElementById('loading').style.display = show ? 'block' : 'none';
-        }
-    </script>
-</body>
-</html>
-)rawliteral";
-
-// ==================== SETUP FUNCTION ====================
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== ESP32 Recipe Controller Starting ===");
   
   // Initialize LittleFS
   if (!LittleFS.begin(true)) {
-    Serial.println("LittleFS Mount Failed - formatting...");
-    LittleFS.format();
-    if (!LittleFS.begin()) {
-      Serial.println("LittleFS Mount Failed after format!");
-      return;
-    }
+    Serial.println("An error occurred while mounting LittleFS");
+    return;
   }
   Serial.println("LittleFS mounted successfully");
   
@@ -774,127 +80,112 @@ void setup() {
   pinMode(SPEED2_PIN, OUTPUT);
   pinMode(SPEED3_PIN, OUTPUT);
   
+  // Set all speed pins to LOW (OFF state)
   digitalWrite(SPEED1_PIN, LOW);
   digitalWrite(SPEED2_PIN, LOW);
   digitalWrite(SPEED3_PIN, LOW);
   
-  Serial.println("GPIO pins initialized");
+  // Configure ADC pins with 11dB attenuation for 0-3.3V range
+  analogSetPinAttenuation(VOLTAGE_PIN, ADC_11db);
+  analogSetPinAttenuation(CURRENT_PIN, ADC_11db);
   
-  // Configure ADC
-  analogSetPinAttenuation(V_PIN, ADC_11db);  // 0-3.3V range
-  analogSetPinAttenuation(I_PIN, ADC_11db);  // 0-3.3V range
-  
-  Serial.println("ADC configured");
-  
-  // Start WiFi Access Point
+  // Set up Access Point
+  WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
+  
   IPAddress IP = WiFi.softAPIP();
-  Serial.print("AP IP address: ");
+  Serial.print("Access Point IP address: ");
   Serial.println(IP);
+  Serial.printf("Connect to WiFi: %s\n", AP_SSID);
+  Serial.printf("Password: %s\n", AP_PASSWORD);
+  Serial.printf("Then open browser to: http://%s\n", IP.toString().c_str());
   
-  // Setup web server routes
-  setupWebServer();
+  // Set up web server routes
+  setupRoutes();
   
-  // Start sensor reading timer
-  sensorTicker.attach_ms(UPDATE_INTERVAL, readSensors);
-  
-  Serial.println("=== Setup Complete ===");
-  Serial.println("Connect to WiFi: " + String(AP_SSID));
-  Serial.println("Password: " + String(AP_PASSWORD));
-  Serial.println("Browse to: http://192.168.4.1");
+  // Start server
+  server.begin();
+  Serial.println("HTTP server started");
 }
 
-// ==================== MAIN LOOP ====================
 void loop() {
   server.handleClient();
   
-  // Handle recipe timer completion
-  if (recipeRunning && (millis() - recipeStartTime >= recipeDuration)) {
-    Serial.println("Recipe timer completed - stopping");
-    setSpeedLevel(0);  // Turn off all speeds
-    recipeRunning = false;
+  // Update sensor readings
+  if (millis() - lastSensorUpdate >= SENSOR_UPDATE_INTERVAL) {
+    readSensors();
+    lastSensorUpdate = millis();
   }
   
-  delay(10);  // Small delay for stability
+  // Check recipe timer
+  checkRecipeTimer();
 }
 
-// ==================== WEB SERVER SETUP ====================
-void setupWebServer() {
+void setupRoutes() {
   // Serve main page
   server.on("/", HTTP_GET, []() {
-    server.send_P(200, "text/html", indexHTML);
+    server.send(200, "text/html", getMainPage());
   });
   
-  // Status endpoint
-  server.on("/status", HTTP_GET, handleStatus);
+  // API endpoint for sensor status
+  server.on("/status", HTTP_GET, []() {
+    StaticJsonDocument<200> doc;
+    doc["voltage"] = voltage;
+    doc["current"] = current;
+    doc["power"] = power;
+    doc["speedState"] = currentSpeed;
+    doc["recipeRunning"] = recipeRunning;
+    doc["runningRecipe"] = runningRecipeName;
+    
+    if (recipeRunning && recipeTimerSeconds > 0) {
+      unsigned long elapsed = (millis() - recipeStartTime) / 1000;
+      doc["remainingTime"] = (elapsed < recipeTimerSeconds) ? (recipeTimerSeconds - elapsed) : 0;
+    } else {
+      doc["remainingTime"] = 0;
+    }
+    
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+  });
   
-  // Toggle speed endpoint
-  server.on("/toggle", HTTP_POST, handleToggle);
+  // API endpoint for speed control
+  server.on("/toggle", HTTP_POST, []() {
+    if (recipeRunning) {
+      server.send(400, "application/json", "{\"error\":\"Cannot change speed while recipe is running\"}");
+      return;
+    }
+    
+    if (server.hasArg("speed")) {
+      int speed = server.arg("speed").toInt();
+      setSpeed(speed);
+      server.send(200, "application/json", "{\"success\":true}");
+    } else {
+      server.send(400, "application/json", "{\"error\":\"Missing speed parameter\"}");
+    }
+  });
   
-  // Recipe CRUD endpoints
+  // Recipe management endpoints
   server.on("/recipes", HTTP_GET, handleGetRecipes);
-  server.on("/recipes", HTTP_POST, handlePostRecipe);
+  server.on("/recipes", HTTP_POST, handleSaveRecipe);
   server.on("/recipes", HTTP_DELETE, handleDeleteRecipe);
-  
-  // Run recipe endpoint
   server.on("/run-recipe", HTTP_POST, handleRunRecipe);
   
-  // Handle CORS
-  server.on("/status", HTTP_OPTIONS, handleCORS);
-  server.on("/toggle", HTTP_OPTIONS, handleCORS);
-// Handle CORS
-  server.on("/status", HTTP_OPTIONS, handleCORS);
-  server.on("/toggle", HTTP_OPTIONS, handleCORS);
-  server.on("/recipes", HTTP_OPTIONS, handleCORS);
-  server.on("/run-recipe", HTTP_OPTIONS, handleCORS);
-  
-  // Handle 404 errors
-  server.onNotFound(handleNotFound);
-  
-  server.begin();
-  Serial.println("Web server started");
+  // 404 handler
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Not found");
+  });
 }
 
-// ==================== SENSOR FUNCTIONS ====================
-void readSensors() {
-  // Read voltage (ZMPT101B)
-  float vSum = 0;
-  for (int i = 0; i < SAMPLES; i++) {
-    int vRaw = analogRead(V_PIN);
-    float vInstant = ((vRaw * VREF) / ADC_MAX) - (VREF / 2.0); // Remove DC bias
-    vSum += vInstant * vInstant;
-    delayMicroseconds(100);
-  }
-  voltage = sqrt(vSum / SAMPLES) * V_CALIB / 1000.0;
-  
-  // Read current (SCT013)
-  float iSum = 0;
-  for (int i = 0; i < SAMPLES; i++) {
-    int iRaw = analogRead(I_PIN);
-    float iInstant = ((iRaw * VREF) / ADC_MAX) - (VREF / 2.0); // Remove DC bias
-    iSum += iInstant * iInstant;
-    delayMicroseconds(100);
-  }
-  current = sqrt(iSum / SAMPLES) * I_CALIB / 1000.0;
-  
-  // Calculate power
-  power = voltage * current;
-  
-  // Ensure reasonable bounds
-  if (voltage < 0) voltage = 0;
-  if (current < 0) current = 0;
-  if (power < 0) power = 0;
-}
-
-// ==================== SPEED CONTROL FUNCTIONS ====================
-void setSpeedLevel(int speed) {
-  // Turn off all speeds first
+void setSpeed(int speed) {
+  // Turn off all speed pins first
   digitalWrite(SPEED1_PIN, LOW);
   digitalWrite(SPEED2_PIN, LOW);
   digitalWrite(SPEED3_PIN, LOW);
   
-  // Set the requested speed
   currentSpeed = speed;
+  
+  // Turn on the selected speed pin
   switch (speed) {
     case 1:
       digitalWrite(SPEED1_PIN, HIGH);
@@ -915,126 +206,117 @@ void setSpeedLevel(int speed) {
   }
 }
 
-// ==================== WEB SERVER HANDLERS ====================
-void handleCORS() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-  server.send(200, "text/plain", "");
-}
-
-void handleStatus() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  
-  DynamicJsonDocument doc(512);
-  doc["voltage"] = voltage;
-  doc["current"] = current;
-  doc["power"] = power;
-  doc["speedState"] = currentSpeed;
-  doc["recipeRunning"] = recipeRunning;
-  
-  String response;
-  serializeJson(doc, response);
-  server.send(200, "application/json", response);
-}
-
-void handleToggle() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  
-  if (recipeRunning) {
-    server.send(400, "application/json", "{\"error\":\"Cannot change speed while recipe is running\"}");
-    return;
+void readSensors() {
+  // Read voltage sensor (ZMPT101B)
+  // Perform RMS calculation
+  long voltageSum = 0;
+  for (int i = 0; i < ADC_SAMPLES; i++) {
+    int sampleV = analogRead(VOLTAGE_PIN);
+    // Remove DC bias (assuming 1.65V bias = 2048 ADC counts)
+    int acV = sampleV - 2048;
+    voltageSum += (long)acV * acV;
   }
   
-  if (server.hasArg("plain")) {
-    DynamicJsonDocument doc(256);
-    DeserializationError error = deserializeJson(doc, server.arg("plain"));
-    
-    if (error) {
-      server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-      return;
+  float voltageRMS = sqrt((float)voltageSum / ADC_SAMPLES);
+  // Convert to actual voltage using calibration factor
+  voltage = (voltageRMS * 3.3 / 4096.0) * V_CALIB / 1000.0;
+  
+  // Read current sensor (SCT013)
+  long currentSum = 0;
+  for (int i = 0; i < ADC_SAMPLES; i++) {
+    int sampleI = analogRead(CURRENT_PIN);
+    // Remove DC bias
+    int acI = sampleI - 2048;
+    currentSum += (long)acI * acI;
+  }
+  
+  float currentRMS = sqrt((float)currentSum / ADC_SAMPLES);
+  // Convert to actual current using calibration factor
+  current = (currentRMS * 3.3 / 4096.0) * I_CALIB / 1000.0;
+  
+  // Calculate power
+  power = voltage * current;
+  
+  // Debug output
+  Serial.printf("V: %.2fV, I: %.2fA, P: %.2fW\n", voltage, current, power);
+}
+
+void checkRecipeTimer() {
+  if (recipeRunning && recipeTimerSeconds > 0) {
+    unsigned long elapsed = (millis() - recipeStartTime) / 1000;
+    if (elapsed >= recipeTimerSeconds) {
+      // Timer finished, stop recipe
+      setSpeed(0);
+      recipeRunning = false;
+      runningRecipeName = "";
+      recipeTimerSeconds = 0;
+      Serial.println("Recipe completed - stopping motor");
     }
-    
-    int speed = doc["speed"] | 0;
-    if (speed >= 0 && speed <= 3) {
-      setSpeedLevel(speed);
-      server.send(200, "application/json", "{\"success\":true}");
-    } else {
-      server.send(400, "application/json", "{\"error\":\"Invalid speed level\"}");
-    }
-  } else {
-    server.send(400, "application/json", "{\"error\":\"No data received\"}");
   }
 }
 
 void handleGetRecipes() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  
   File file = LittleFS.open("/recipes.json", "r");
   if (!file) {
     server.send(200, "application/json", "[]");
     return;
   }
   
-  String content = file.readString();
+  String recipes = file.readString();
   file.close();
-  
-  server.send(200, "application/json", content);
+  server.send(200, "application/json", recipes);
 }
 
-void handlePostRecipe() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  
-  if (server.hasArg("plain")) {
-    DynamicJsonDocument newRecipe(512);
-    DeserializationError error = deserializeJson(newRecipe, server.arg("plain"));
-    
-    if (error) {
-      server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-      return;
-    }
-    
-    // Load existing recipes
-    DynamicJsonDocument recipes(4096);
-    File file = LittleFS.open("/recipes.json", "r");
-    if (file) {
-      deserializeJson(recipes, file);
-      file.close();
-    } else {
-      recipes = DynamicJsonDocument(4096);
-      recipes.to<JsonArray>();
-    }
-    
-    // Add new recipe
-    JsonArray array = recipes.as<JsonArray>();
-    array.add(newRecipe.as<JsonObject>());
-    
-    // Save back to file
-    file = LittleFS.open("/recipes.json", "w");
-    if (file) {
-      serializeJson(recipes, file);
-      file.close();
-      server.send(200, "application/json", "{\"success\":true}");
-    } else {
-      server.send(500, "application/json", "{\"error\":\"Failed to save recipe\"}");
-    }
-  } else {
+void handleSaveRecipe() {
+  if (!server.hasArg("plain")) {
     server.send(400, "application/json", "{\"error\":\"No data received\"}");
+    return;
+  }
+  
+  String body = server.arg("plain");
+  StaticJsonDocument<2048> doc;
+  DeserializationError error = deserializeJson(doc, body);
+  
+  if (error) {
+    server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+    return;
+  }
+  
+  // Load existing recipes
+  DynamicJsonDocument recipes(8192);
+  File file = LittleFS.open("/recipes.json", "r");
+  if (file) {
+    deserializeJson(recipes, file);
+    file.close();
+  } else {
+    recipes = DynamicJsonDocument(8192);
+  }
+  
+  // Add new recipe
+  JsonArray array = recipes.as<JsonArray>();
+  array.add(doc);
+  
+  // Save back to file
+  file = LittleFS.open("/recipes.json", "w");
+  if (file) {
+    serializeJson(recipes, file);
+    file.close();
+    server.send(200, "application/json", "{\"success\":true}");
+  } else {
+    server.send(500, "application/json", "{\"error\":\"Failed to save recipe\"}");
   }
 }
 
 void handleDeleteRecipe() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  
-  if (!server.hasArg("index")) {
-    server.send(400, "application/json", "{\"error\":\"No index provided\"}");
+  if (!server.hasArg("name")) {
+    server.send(400, "application/json", "{\"error\":\"Missing recipe name\"}");
     return;
   }
   
-  int index = server.arg("index").toInt();
+  String recipeName = server.arg("name");
   
   // Load existing recipes
-  DynamicJsonDocument recipes(4096);
+  DynamicJsonDocument recipes(8192);
   File file = LittleFS.open("/recipes.json", "r");
   if (!file) {
     server.send(404, "application/json", "{\"error\":\"No recipes found\"}");
@@ -1044,14 +326,14 @@ void handleDeleteRecipe() {
   deserializeJson(recipes, file);
   file.close();
   
+  // Find and remove recipe
   JsonArray array = recipes.as<JsonArray>();
-  if (index < 0 || index >= array.size()) {
-    server.send(400, "application/json", "{\"error\":\"Invalid index\"}");
-    return;
+  for (int i = array.size() - 1; i >= 0; i--) {
+    if (array[i]["recipeName"] == recipeName) {
+      array.remove(i);
+      break;
+    }
   }
-  
-  // Remove recipe at index
-  array.remove(index);
   
   // Save back to file
   file = LittleFS.open("/recipes.json", "w");
@@ -1065,271 +347,720 @@ void handleDeleteRecipe() {
 }
 
 void handleRunRecipe() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  
   if (recipeRunning) {
-    server.send(400, "application/json", "{\"error\":\"Another recipe is already running\"}");
+    server.send(400, "application/json", "{\"error\":\"Recipe already running\"}");
     return;
   }
   
-  if (server.hasArg("plain")) {
-    DynamicJsonDocument doc(256);
-    DeserializationError error = deserializeJson(doc, server.arg("plain"));
-    
-    if (error) {
-      server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-      return;
-    }
-    
-    int speedLevel = doc["speedLevel"] | 1;
-    int timer = doc["timer"] | 0;
-    
-    if (speedLevel < 1 || speedLevel > 3) {
-      server.send(400, "application/json", "{\"error\":\"Invalid speed level\"}");
-      return;
-    }
-    
-    if (timer <= 0) {
-      server.send(400, "application/json", "{\"error\":\"Invalid timer value\"}");
-      return;
-    }
-    
-    // Start recipe
-    recipeRunning = true;
-    recipeStartTime = millis();
-    recipeDuration = timer * 1000;  // Convert to milliseconds
-    recipeSpeed = speedLevel;
-    
-    setSpeedLevel(speedLevel);
-    
-    Serial.println("Recipe started - Speed: " + String(speedLevel) + ", Timer: " + String(timer) + "s");
-    
-    server.send(200, "application/json", "{\"success\":true}");
-  } else {
+  if (!server.hasArg("plain")) {
     server.send(400, "application/json", "{\"error\":\"No data received\"}");
-  }
-}
-// ==================== UTILITY FUNCTIONS ====================
-void printSystemInfo() {
-  Serial.println("\n=== System Information ===");
-  Serial.println("Chip Model: " + String(ESP.getChipModel()));
-  Serial.println("Chip Revision: " + String(ESP.getChipRevision()));
-  Serial.println("Flash Size: " + String(ESP.getFlashChipSize() / 1024 / 1024) + "MB");
-  Serial.println("Free Heap: " + String(ESP.getFreeHeap()) + " bytes");
-  Serial.println("WiFi AP IP: " + WiFi.softAPIP().toString());
-  Serial.println("=========================\n");
-}
-
-void handleNotFound() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  String message = "File Not Found\n\n";
-  message += "URI: ";
-  message += server.uri();
-  message += "\nMethod: ";
-  message += (server.method() == HTTP_GET) ? "GET" : "POST";
-  message += "\nArguments: ";
-  message += server.args();
-  message += "\n";
-  for (uint8_t i = 0; i < server.args(); i++) {
-    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
-  }
-  server.send(404, "text/plain", message);
-}
-
-// ==================== ERROR HANDLING ====================
-void handleSystemError(String error) {
-  Serial.println("SYSTEM ERROR: " + error);
-  
-  // Turn off all speeds for safety
-  setSpeedLevel(0);
-  recipeRunning = false;
-  
-  // Could add LED indication, buzzer, etc. here
-}
-
-void checkSystemHealth() {
-  // Check heap memory
-  if (ESP.getFreeHeap() < 10000) {  // Less than 10KB free
-    Serial.println("WARNING: Low heap memory: " + String(ESP.getFreeHeap()));
+    return;
   }
   
-  // Check if filesystem is still mounted
-  if (!LittleFS.exists("/")) {
-    Serial.println("WARNING: LittleFS not accessible");
-    if (!LittleFS.begin(true)) {
-      handleSystemError("LittleFS mount failed");
-    }
+  String body = server.arg("plain");
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, body);
+  
+  if (error) {
+    server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+    return;
   }
   
-  // Check WiFi AP status
-  if (WiFi.softAPgetStationNum() > 10) {  // Too many connections
-    Serial.println("WARNING: High number of AP connections");
-  }
+  String recipeName = doc["recipeName"];
+  int speed = doc["speed"];
+  int timer = doc["timer"];
+  
+  // Start recipe
+  recipeRunning = true;
+  runningRecipeName = recipeName;
+  recipeStartTime = millis();
+  recipeTimerSeconds = timer;
+  
+  setSpeed(speed);
+  
+  Serial.printf("Starting recipe: %s, Speed: %d, Timer: %ds\n", 
+                recipeName.c_str(), speed, timer);
+  
+  server.send(200, "application/json", "{\"success\":true}");
 }
 
-/*
- * ==================== CONFIGURATION NOTES ====================
- * 
- * IMPORTANT: Modify these settings for your specific setup:
- * 
- * 1. CALIBRATION VALUES (Lines 45-46):
- *    - Run calibration sketch first
- *    - Replace V_CALIB and I_CALIB with calculated values
- * 
- * 2. GPIO PINS (Lines 35-39):
- *    - Change pin assignments if using different GPIOs
- *    - Ensure pins don't conflict with internal functions
- *    - Safe alternatives: 2, 4, 12, 13, 14, 15, 25, 26, 27, 32, 33
- * 
- * 3. WIFI CREDENTIALS (Lines 30-31):
- *    - Change AP_SSID and AP_PASSWORD for security
- * 
- * 4. ADC CALIBRATION:
- *    - ESP32 ADC can be non-linear
- *    - For critical applications, consider ADS1115 external ADC
- * 
- * 5. SAFETY FEATURES:
- *    - Recipe timer automatically stops motors
- *    - Only one speed can be active at once
- *    - Manual speed changes blocked during recipe
- * 
- * ==================== HARDWARE ASSEMBLY TIPS ====================
- * 
- * POWER MONITORING CIRCUIT:
- * - Use 1% tolerance resistors for accuracy
- * - Add 10µF capacitor across power rails for stability
- * - Keep sensor wires short and twisted
- * - Use shielded cable for CT connections
- * 
- * SPEED CONTROL OUTPUTS:
- * - Add flyback diodes if driving inductive loads
- * - Use appropriate relays for your motor current
- * - Consider MOSFETs for PWM control applications
- * - Add status LEDs for visual feedback
- * 
- * ENCLOSURE CONSIDERATIONS:
- * - Separate high voltage from low voltage sections
- * - Provide adequate ventilation for ESP32
- * - Use appropriate cable glands for external connections
- * - Label all terminals clearly
- * 
- * ==================== DEBUGGING TIPS ====================
- * 
- * SERIAL MONITOR:
- * - Set baud rate to 115200
- * - Watch for WiFi connection status
- * - Monitor sensor readings during calibration
- * - Check for JSON parsing errors
- * 
- * WEB BROWSER CONSOLE:
- * - Press F12 to open developer tools
- * - Check Network tab for API call failures
- * - Look for JavaScript errors in Console tab
- * - Use Network tab to debug CORS issues
- * 
- * MULTIMETER TESTING:
- * - Verify 3.3V on sensor power pins
- * - Check for 1.65V bias on ADC pins (no AC)
- * - Measure AC voltage on sensor outputs under load
- * - Verify relay operation with continuity test
- * 
- * ==================== UPGRADE PATHS ====================
- * 
- * ENHANCED FEATURES:
- * - Add temperature sensors for motor monitoring
- * - Implement PID control for precise speed regulation  
- * - Add data logging with timestamps
- * - Create mobile app with notifications
- * - Add voice control integration
- * 
- * CONNECTIVITY UPGRADES:
- * - Add WiFi client mode for home network integration
- * - Implement MQTT for IoT integration
- * - Add Bluetooth for direct phone pairing
- * - Create REST API for third-party integration
- * 
- * SAFETY ENHANCEMENTS:
- * - Add current limit monitoring
- * - Implement motor stall detection
- * - Add emergency stop button
- * - Create maintenance scheduling system
- * 
- * ==================== EXAMPLE MODIFICATIONS ====================
- * 
- * To add PWM speed control instead of simple ON/OFF:
- * 
- * void setSpeedLevel(int speed) {
- *   analogWrite(SPEED1_PIN, 0);
- *   analogWrite(SPEED2_PIN, 0);
- *   analogWrite(SPEED3_PIN, 0);
- *   
- *   switch (speed) {
- *     case 1: analogWrite(SPEED1_PIN, 85); break;   // 33% duty
- *     case 2: analogWrite(SPEED2_PIN, 170); break;  // 66% duty  
- *     case 3: analogWrite(SPEED3_PIN, 255); break;  // 100% duty
- *   }
- *   currentSpeed = speed;
- * }
- * 
- * To add external ADS1115 ADC for better precision:
- * 
- * #include <Adafruit_ADS1X15.h>
- * Adafruit_ADS1115 ads;
- * 
- * // In setup():
- * ads.begin();
- * ads.setGain(GAIN_ONE);  // ±4.096V range
- * 
- * // In readSensors():
- * int16_t vRaw = ads.readADC_SingleEnded(0);  // A0
- * int16_t iRaw = ads.readADC_SingleEnded(1);  // A1
- * 
- * To add MQTT publishing:
- * 
- * #include <PubSubClient.h>
- * WiFiClient espClient;
- * PubSubClient mqtt(espClient);
- * 
- * void publishPowerData() {
- *   String payload = "{\"V\":" + String(voltage) + 
- *                   ",\"I\":" + String(current) + 
- *                   ",\"P\":" + String(power) + "}";
- *   mqtt.publish("esp32/power", payload.c_str());
- * }
- * 
- * ==================== TROUBLESHOOTING GUIDE ====================
- * 
- * COMMON ISSUES AND SOLUTIONS:
- * 
- * 1. "LittleFS Mount Failed":
- *    - Normal on first boot - will auto-format
- *    - Check flash size (minimum 4MB recommended)
- *    - Try different partition scheme in Arduino IDE
- * 
- * 2. "WiFi AP not visible":
- *    - Check SSID and password in code
- *    - Ensure ESP32 has adequate power supply
- *    - Try different WiFi channel
- * 
- * 3. "Power readings always zero":
- *    - Verify sensor wiring and power
- *    - Check calibration constants
- *    - Test with known load and multimeter
- * 
- * 4. "Web page won't load":
- *    - Confirm IP address (192.168.4.1)
- *    - Try different browser or clear cache
- *    - Check ESP32 serial output for errors
- * 
- * 5. "Recipes won't save":
- *    - Check JSON format in browser console
- *    - Verify LittleFS is mounted
- *    - Ensure sufficient heap memory
- * 
- * 6. "Speed controls not working":
- *    - Verify GPIO pin connections
- *    - Check relay coil voltage compatibility
- *    - Test individual pins with multimeter
- * 
- * Remember to always prioritize safety when working with electrical systems!
- */
+// Continue with HTML page content...
+String getMainPage() {
+  return R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 Recipe Manager</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 10px;
+        }
+        
+        .container {
+            max-width: 480px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+            position: relative;
+        }
+        
+        .hamburger {
+            position: absolute;
+            right: 20px;
+            top: 20px;
+            background: none;
+            border: none;
+            color: white;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 5px;
+        }
+        
+        .content {
+            padding: 20px;
+        }
+        
+        .sensor-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        
+        .sensor-card {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 15px;
+            text-align: center;
+            border: 2px solid #e9ecef;
+        }
+        
+        .sensor-value {
+            font-size: 1.5em;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 5px;
+        }
+        
+        .sensor-label {
+            color: #666;
+            font-size: 0.9em;
+        }
+        
+        .speed-controls {
+            margin-bottom: 30px;
+        }
+        
+        .speed-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+        }
+        
+        .toggle-switch {
+            position: relative;
+            width: 100%;
+            height: 60px;
+        }
+        
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        
+        .toggle-label {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            border-radius: 30px;
+            transition: 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            color: #666;
+        }
+        
+        .toggle-switch input:checked + .toggle-label {
+            background-color: #4CAF50;
+            color: white;
+        }
+        
+        .toggle-switch input:disabled + .toggle-label {
+            background-color: #ddd;
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+        
+        .recipes-section {
+            display: none;
+        }
+        
+        .recipe-form {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .form-group {
+            margin-bottom: 15px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+        }
+        
+        .ingredients-table {
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-bottom: 15px;
+            border: 2px solid #ddd;
+        }
+        
+        .table-header {
+            background: #667eea;
+            color: white;
+            display: grid;
+            grid-template-columns: 2fr 1fr 1fr;
+            gap: 1px;
+            font-weight: bold;
+        }
+        
+        .table-header > div {
+            padding: 10px;
+            text-align: center;
+        }
+        
+        .ingredient-row {
+            display: grid;
+            grid-template-columns: 2fr 1fr 1fr;
+            gap: 1px;
+            background: #f8f9fa;
+        }
+        
+        .ingredient-row input {
+            border: none;
+            padding: 10px;
+            background: white;
+            font-size: 14px;
+        }
+        
+        .add-ingredient-btn {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-bottom: 15px;
+        }
+        
+        .btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+            margin-bottom: 10px;
+        }
+        
+        .btn:hover {
+            background: #5a6fd8;
+        }
+        
+        .btn-danger {
+            background: #dc3545;
+        }
+        
+        .btn-danger:hover {
+            background: #c82333;
+        }
+        
+        .recipe-card {
+            background: #f8f9fa;
+            border-radius: 15px;
+            margin-bottom: 15px;
+            overflow: hidden;
+            border: 2px solid #ddd;
+        }
+        
+        .recipe-header {
+            padding: 15px;
+            background: white;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .recipe-title {
+            font-weight: bold;
+            font-size: 1.1em;
+        }
+        
+        .recipe-info {
+            font-size: 0.9em;
+            color: #666;
+        }
+        
+        .recipe-details {
+            display: none;
+            padding: 15px;
+            border-top: 1px solid #ddd;
+        }
+        
+        .recipe-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        
+        .back-btn {
+            background: #6c757d;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-bottom: 20px;
+        }
+        
+        .timer-display {
+            background: #ff6b6b;
+            color: white;
+            padding: 10px;
+            border-radius: 8px;
+            text-align: center;
+            font-size: 1.2em;
+            font-weight: bold;
+            margin-bottom: 15px;
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3498db;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Recipe Manager</h1>
+            <button class="hamburger" onclick="toggleView()">☰</button>
+        </div>
+        
+        <div class="content">
+            <div id="mainPage">
+                <div class="sensor-grid">
+                    <div class="sensor-card">
+                        <div class="sensor-value" id="voltage">0.0</div>
+                        <div class="sensor-label">Volts</div>
+                    </div>
+                    <div class="sensor-card">
+                        <div class="sensor-value" id="current">0.0</div>
+                        <div class="sensor-label">Amps</div>
+                    </div>
+                    <div class="sensor-card">
+                        <div class="sensor-value" id="power">0.0</div>
+                        <div class="sensor-label">Watts</div>
+                    </div>
+                </div>
+                
+                <div id="timerDisplay" class="timer-display hidden">
+                    <div>Recipe Running: <span id="runningRecipeName"></span></div>
+                    <div>Time Remaining: <span id="remainingTime">0</span>s</div>
+                </div>
+                
+                <div class="speed-controls">
+                    <h3 style="margin-bottom: 15px;">Speed Control</h3>
+                    <div class="speed-grid">
+                        <div class="toggle-switch">
+                            <input type="radio" id="speedOff" name="speed" value="0" checked>
+                            <label for="speedOff" class="toggle-label">OFF</label>
+                        </div>
+                        <div class="toggle-switch">
+                            <input type="radio" id="speed1" name="speed" value="1">
+                            <label for="speed1" class="toggle-label">Speed 1</label>
+                        </div>
+                        <div class="toggle-switch">
+                            <input type="radio" id="speed2" name="speed" value="2">
+                            <label for="speed2" class="toggle-label">Speed 2</label>
+                        </div>
+                        <div class="toggle-switch">
+                            <input type="radio" id="speed3" name="speed" value="3">
+                            <label for="speed3" class="toggle-label">Speed 3</label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div id="recipePage" class="recipes-section">
+                <button class="back-btn" onclick="toggleView()">← Back to Controls</button>
+                
+                <div class="recipe-form">
+                    <h3 style="margin-bottom: 15px;">Add New Recipe</h3>
+                    
+                    <div class="form-group">
+                        <label for="recipeName">Recipe Name:</label>
+                        <input type="text" id="recipeName" placeholder="Enter recipe name">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Ingredients:</label>
+                        <div class="ingredients-table">
+                            <div class="table-header">
+                                <div>Ingredient</div>
+                                <div>Weight (g)</div>
+                                <div>Calories</div>
+                            </div>
+                            <div id="ingredientsContainer">
+                                <div class="ingredient-row">
+                                    <input type="text" placeholder="Ingredient name" class="ingredient-name">
+                                    <input type="number" placeholder="0" class="ingredient-weight">
+                                    <input type="number" placeholder="0" class="ingredient-calories">
+                                </div>
+                            </div>
+                        </div>
+                        <button class="add-ingredient-btn" onclick="addIngredientRow()">+ Add Ingredient</button>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="servingSize">Serving Size:</label>
+                        <input type="number" id="servingSize" placeholder="Enter serving size">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="speedLevel">Speed Level:</label>
+                        <select id="speedLevel">
+                            <option value="1">Speed 1</option>
+                            <option value="2">Speed 2</option>
+                            <option value="3">Speed 3</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="timer">Timer (seconds):</label>
+                        <input type="number" id="timer" placeholder="Enter time in seconds">
+                    </div>
+                    
+                    <button class="btn" onclick="saveRecipe()">Save Recipe</button>
+                </div>
+                
+                <div id="savedRecipes">
+                    <h3 style="margin-bottom: 15px;">Saved Recipes</h3>
+                    <div id="recipesList"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentView = 'main';
+        let statusUpdateInterval;
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            updateStatus();
+            statusUpdateInterval = setInterval(updateStatus, 1000);
+            loadRecipes();
+            
+            document.querySelectorAll('input[name="speed"]').forEach(radio => {
+                radio.addEventListener('change', function() {
+                    if (!this.disabled) {
+                        setSpeed(parseInt(this.value));
+                    }
+                });
+            });
+        });
+        
+        function toggleView() {
+            const mainPage = document.getElementById('mainPage');
+            const recipePage = document.getElementById('recipePage');
+            
+            if (currentView === 'main') {
+                mainPage.style.display = 'none';
+                recipePage.style.display = 'block';
+                currentView = 'recipe';
+                loadRecipes();
+            } else {
+                mainPage.style.display = 'block';
+                recipePage.style.display = 'none';
+                currentView = 'main';
+            }
+        }
+        
+        async function updateStatus() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+                
+                document.getElementById('voltage').textContent = data.voltage.toFixed(1);
+                document.getElementById('current').textContent = data.current.toFixed(2);
+                document.getElementById('power').textContent = data.power.toFixed(1);
+                
+                const speedRadios = document.querySelectorAll('input[name="speed"]');
+                speedRadios.forEach(radio => {
+                    radio.checked = (parseInt(radio.value) === data.speedState);
+                    radio.disabled = data.recipeRunning;
+                });
+                
+                const timerDisplay = document.getElementById('timerDisplay');
+                if (data.recipeRunning) {
+                    timerDisplay.classList.remove('hidden');
+                    document.getElementById('runningRecipeName').textContent = data.runningRecipe;
+                    document.getElementById('remainingTime').textContent = data.remainingTime || 0;
+                } else {
+                    timerDisplay.classList.add('hidden');
+                }
+                
+            } catch (error) {
+                console.error('Error updating status:', error);
+            }
+        }
+        
+        async function setSpeed(speed) {
+            try {
+                const response = await fetch('/toggle', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: 'speed=' + speed
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    alert(error.error || 'Failed to set speed');
+                }
+            } catch (error) {
+                console.error('Error setting speed:', error);
+                alert('Failed to communicate with device');
+            }
+        }
+        
+        function addIngredientRow() {
+            const container = document.getElementById('ingredientsContainer');
+            const newRow = document.createElement('div');
+            newRow.className = 'ingredient-row';
+            newRow.innerHTML = '<input type="text" placeholder="Ingredient name" class="ingredient-name"><input type="number" placeholder="0" class="ingredient-weight"><input type="number" placeholder="0" class="ingredient-calories">';
+            container.appendChild(newRow);
+        }
+        
+        async function saveRecipe() {
+            const recipeName = document.getElementById('recipeName').value.trim();
+            if (!recipeName) {
+                alert('Please enter a recipe name');
+                return;
+            }
+            
+            const ingredients = [];
+            const ingredientRows = document.querySelectorAll('.ingredient-row');
+            
+            ingredientRows.forEach(row => {
+                const name = row.querySelector('.ingredient-name').value.trim();
+                const weight = parseFloat(row.querySelector('.ingredient-weight').value) || 0;
+                const calories = parseFloat(row.querySelector('.ingredient-calories').value) || 0;
+                
+                if (name) {
+                    ingredients.push({
+                        name: name,
+                        weight: weight,
+                        calories: calories
+                    });
+                }
+            });
+            
+            if (ingredients.length === 0) {
+                alert('Please add at least one ingredient');
+                return;
+            }
+            
+            const servingSize = parseFloat(document.getElementById('servingSize').value) || 1;
+            const speedLevel = parseInt(document.getElementById('speedLevel').value);
+            const timer = parseInt(document.getElementById('timer').value) || 0;
+            
+            const recipe = {
+                recipeName: recipeName,
+                ingredients: ingredients,
+                servingSize: servingSize,
+                speedLevel: speedLevel,
+                timer: timer
+            };
+            
+            try {
+                const response = await fetch('/recipes', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(recipe)
+                });
+                
+                if (response.ok) {
+                    alert('Recipe saved successfully!');
+                    clearRecipeForm();
+                    loadRecipes();
+                } else {
+                    const error = await response.json();
+                    alert(error.error || 'Failed to save recipe');
+                }
+            } catch (error) {
+                console.error('Error saving recipe:', error);
+                alert('Failed to save recipe');
+            }
+        }
+        
+        function clearRecipeForm() {
+            document.getElementById('recipeName').value = '';
+            document.getElementById('servingSize').value = '';
+            document.getElementById('timer').value = '';
+            
+            const container = document.getElementById('ingredientsContainer');
+            const firstRow = container.querySelector('.ingredient-row');
+            container.innerHTML = '';
+            container.appendChild(firstRow);
+            
+            firstRow.querySelectorAll('input').forEach(input => input.value = '');
+        }
+        
+        async function loadRecipes() {
+            try {
+                const response = await fetch('/recipes');
+                const recipes = await response.json();
+                
+                const recipesList = document.getElementById('recipesList');
+                recipesList.innerHTML = '';
+                
+                recipes.forEach(recipe => {
+                    const totalCalories = recipe.ingredients.reduce((sum, ing) => sum + ing.calories, 0);
+                    
+                    const recipeCard = document.createElement('div');
+                    recipeCard.className = 'recipe-card';
+                    recipeCard.innerHTML = '<div class="recipe-header" onclick="toggleRecipeDetails(\'' + recipe.recipeName + '\')"><div><div class="recipe-title">' + recipe.recipeName + '</div><div class="recipe-info">Total Calories: ' + totalCalories + '</div></div><div>▼</div></div><div class="recipe-details" id="details-' + recipe.recipeName + '"><div><strong>Ingredients:</strong></div>' + recipe.ingredients.map(ing => '<div>• ' + ing.name + ': ' + ing.weight + 'g (' + ing.calories + ' cal)</div>').join('') + '<div style="margin-top: 10px;"><strong>Serving Size:</strong> ' + recipe.servingSize + '</div><div><strong>Speed Level:</strong> ' + recipe.speedLevel + '</div><div><strong>Timer:</strong> ' + recipe.timer + ' seconds</div><div class="recipe-actions"><button class="btn" onclick="runRecipe(\'' + recipe.recipeName + '\', ' + recipe.speedLevel + ', ' + recipe.timer + ')">Run Recipe</button><button class="btn btn-danger" onclick="deleteRecipe(\'' + recipe.recipeName + '\')">Delete</button></div></div>';
+                    recipesList.appendChild(recipeCard);
+                });
+                
+                if (recipes.length === 0) {
+                    recipesList.innerHTML = '<p style="text-align: center; color: #666;">No recipes saved yet</p>';
+                }
+            } catch (error) {
+                console.error('Error loading recipes:', error);
+            }
+        }
+        
+        function toggleRecipeDetails(recipeName) {
+            const details = document.getElementById('details-' + recipeName);
+            const isVisible = details.style.display === 'block';
+            details.style.display = isVisible ? 'none' : 'block';
+        }
+        
+        async function runRecipe(recipeName, speedLevel, timer) {
+            try {
+                const response = await fetch('/run-recipe', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        recipeName: recipeName,
+                        speed: speedLevel,
+                        timer: timer
+                    })
+                });
+                
+                if (response.ok) {
+                    alert('Started recipe: ' + recipeName);
+                    if (currentView === 'recipe') {
+                        toggleView();
+                    }
+                } else {
+                    const error = await response.json();
+                    alert(error.error || 'Failed to start recipe');
+                }
+            } catch (error) {
+                console.error('Error running recipe:', error);
+                alert('Failed to start recipe');
+            }
+        }
+        
+        async function deleteRecipe(recipeName) {
+            if (!confirm('Are you sure you want to delete "' + recipeName + '"?')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/recipes?name=' + encodeURIComponent(recipeName), {
+                    method: 'DELETE'
+                });
+                
+                if (response.ok) {
+                    alert('Recipe deleted successfully');
+                    loadRecipes();
+                } else {
+                    const error = await response.json();
+                    alert(error.error || 'Failed to delete recipe');
+                }
+            } catch (error) {
+                console.error('Error deleting recipe:', error);
+                alert('Failed to delete recipe');
+            }
+        }
+    </script>
+</body>
+</html>
+)rawliteral";
+}
