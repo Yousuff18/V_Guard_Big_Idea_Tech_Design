@@ -1,0 +1,973 @@
+/* ==================================================================================
+   ESP32 Recipe Manager + AP Onboarding + Company Recipes Fetch (Airtable example)
+   Target: ESP32 DevKit (38-pin)
+   Arduino IDE compatible (.ino)
+
+   FEATURES
+   - AP captive portal on first boot (WiFiManager). Enter Wi-Fi credentials.
+   - Switches to Station mode, serves local web UI at http://esp32.local (mDNS) or device IP.
+   - Home page: Off / Speed1 / Speed2 / Speed3 (mutually exclusive).
+   - My Recipes: local recipes stored on SPIFFS (/recipes_local.json)
+   - Company Recipes: fetched from Airtable (configurable API URL + API key); normalized by ESP32
+   - User can Run Now (without saving) or Add to My Recipes (save locally)
+   - Secure-ish: domain whitelist, API key stored in NVS, API key never exposed to browser
+   - Non-blocking timers (millis-based)
+   - Endpoints: /api/state, /api/speed, /api/recipes/local, /api/recipes/local/add, /api/recipes/run, /api/company/list, /api/settings/*
+   - Device PIN support via header "X-Device-PIN" for mutating operations
+
+   QUICK START
+   1. Install Arduino IDE + ESP32 board package (Espressif 2.x).
+   2. Install libraries:
+      - WiFiManager by tzapu
+      - AsyncTCP
+      - ESPAsyncWebServer
+      - ArduinoJson (v6)
+      - Preferences (built-in)
+      - SPIFFS (built-in)
+   3. Copy/paste this file into Arduino IDE, set board to ESP32 Dev Module, select port.
+   4. Compile & Upload.
+   5. Power the board. Connect your phone to SSID "ESP32_Setup" (password: configureme).
+      Open http://192.168.4.1 or wait for captive portal. Enter your Wi-Fi SSID and password.
+   6. After reboot, visit http://esp32.local or the IP shown in serial monitor.
+   7. Go to Settings -> paste Airtable API URL and API Key, Allowed Domain (api.airtable.com), Save, Test API.
+   8. Use Company Recipes -> Refresh -> Run Now / Add to My Recipes.
+
+   NOTES & CAUTIONS
+   - Do NOT drive motors directly from ESP32 pins. Use external drivers/relays.
+   - Airtable example expects an "ingredients" field that contains JSON text for an array of ingredient objects.
+   - HTTPS: By default this sketch uses an option to set WiFiClientSecure::setInsecure() for quick testing.
+     For production, replace with proper root certificate verification (see lines marked TLS_PRODUCTION_CERT).
+   - If something is ambiguous, check serial output for errors.
+
+   ================================================================================== */
+
+/* =================== CONFIGURATION / INCLUDES =================== */
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WebServer.h> // fallback for WiFiManager captive portal (some versions)
+#include <ESPmDNS.h>
+#include <Preferences.h>
+#include <SPIFFS.h>
+
+#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+#define USE_INSECURE_TLS true   // <--- Set false for production and paste proper root cert below
+
+/* ==== PIN ASSIGNMENTS - edit here if you need different pins ==== */
+// Use safe GPIOs (not strapping pins)
+const int PIN_SPEED1 = 25; // Speed 1 output (active HIGH)
+const int PIN_SPEED2 = 26; // Speed 2 output (active HIGH)
+const int PIN_SPEED3 = 27; // Speed 3 output (active HIGH)
+// Off: all speed pins LOW
+
+/* ==== STORAGE KEYS ==== */
+Preferences prefs;
+const char *PREF_NAMESPACE = "recipe_cfg";
+const char *KEY_API_URL = "api_url";
+const char *KEY_API_KEY = "api_key";
+const char *KEY_ALLOWED_DOMAIN = "allow_dom";
+const char *KEY_DEVICE_PIN = "device_pin";
+
+/* ==== FILES ==== */
+const char *LOCAL_RECIPES = "/recipes_local.json";
+const char *LOCAL_RECIPES_TMP = "/recipes_local.tmp";
+
+/* ==== SERVER, WIFI, STATE ==== */
+AsyncWebServer server(80);
+WiFiManager wm;
+bool hasCredentials = false;
+String deviceIp = "";
+bool mDNSStarted = false;
+
+/* ==== RUN/TIMER STATE ==== */
+volatile int activeSpeed = 0; // 0=off,1,2,3
+unsigned long runUntilMs = 0;
+bool runInProgress = false;
+
+/* ==== CACHING / RATE LIMIT ==== */
+unsigned long lastCompanyFetchMs = 0;
+String companyCacheJson = "";
+const unsigned long COMPANY_CACHE_TTL_MS = 10 * 1000; // 10 seconds
+const unsigned long COMPANY_RATE_LIMIT_MS = 3000;     // at least 3s between fetches
+
+/* ==== DEFAULTS ==== */
+// Example Airtable API URL placeholder (replace in settings)
+const char *DEFAULT_API_URL = "https://api.airtable.com/v0/<BASE_ID>/recipes?pageSize=50&view=Grid%20view";
+const char *DEFAULT_ALLOWED_DOMAIN = "api.airtable.com";
+
+/* TLS production cert placeholder (PEM) - if USE_INSECURE_TLS=false, paste root cert here */
+const char *TLS_PRODUCTION_CERT = "-----BEGIN CERTIFICATE-----\n...paste root CA here...\n-----END CERTIFICATE-----\n";
+
+/* =================== HELPERS: JSON, FILES, UTIL =================== */
+
+void ensureSpiffs() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS.begin() failed! Formatting...");
+    SPIFFS.format();
+    SPIFFS.begin(true);
+  }
+}
+
+String atomicReadFile(const char *path) {
+  if (!SPIFFS.exists(path)) return "[]";
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) return "[]";
+  String s;
+  while (f.available()) s += (char)f.read();
+  f.close();
+  return s;
+}
+
+bool atomicWriteFile(const char *path, const String &content) {
+  // write to tmp then rename
+  File f = SPIFFS.open(LOCAL_RECIPES_TMP, FILE_WRITE);
+  if (!f) {
+    Serial.println("Failed to open tmp file for write");
+    return false;
+  }
+  size_t written = f.print(content);
+  f.close();
+  if (written == 0) {
+    Serial.println("Nothing written to tmp file");
+    return false;
+  }
+  // remove old and rename
+  if (SPIFFS.exists(path)) SPIFFS.remove(path);
+  bool ok = SPIFFS.rename(LOCAL_RECIPES_TMP, path);
+  if (!ok) Serial.println("Failed to rename tmp to target");
+  return ok;
+}
+
+String getPrefString(const char *key, const char *def = "") {
+  if (!prefs.begin(PREF_NAMESPACE, true)) {
+    // readonly
+  }
+  String val = prefs.getString(key, def);
+  prefs.end();
+  return val;
+}
+
+void setPrefString(const char *key, const String &val) {
+  prefs.begin(PREF_NAMESPACE, false);
+  prefs.putString(key, val);
+  prefs.end();
+}
+
+/* =================== SAFETY / DOMAIN CHECK =================== */
+
+bool isDomainAllowed(const String &url) {
+  String allowed = getPrefString(KEY_ALLOWED_DOMAIN, DEFAULT_ALLOWED_DOMAIN);
+  // naive host extraction
+  int pos = url.indexOf("://");
+  int start = (pos >= 0) ? pos + 3 : 0;
+  int slash = url.indexOf('/', start);
+  String host = (slash >= 0) ? url.substring(start, slash) : url.substring(start);
+  // remove optional port
+  int colon = host.indexOf(':');
+  if (colon >= 0) host = host.substring(0, colon);
+  host.toLowerCase();
+  allowed.toLowerCase();
+  return host == allowed;
+}
+
+/* =================== COMPANY FETCH (Airtable) =================== */
+
+String fetchCompanyRecipes() {
+  unsigned long now = millis();
+  if (now - lastCompanyFetchMs < COMPANY_RATE_LIMIT_MS && companyCacheJson.length()) {
+    // serve cached
+    return companyCacheJson;
+  }
+  String apiUrl = getPrefString(KEY_API_URL, DEFAULT_API_URL);
+  String apiKey = getPrefString(KEY_API_KEY, "");
+  if (apiUrl.length() == 0 || apiKey.length() == 0) {
+    Serial.println("API URL or API Key not set");
+    return "[]";
+  }
+  if (!isDomainAllowed(apiUrl)) {
+    Serial.println("Domain not allowed for API URL");
+    return "[]";
+  }
+
+  HTTPClient http;
+  WiFiClientSecure *wcs = nullptr;
+  WiFiClient *wc = nullptr;
+
+  if (apiUrl.startsWith("https://")) {
+    WiFiClientSecure *w = new WiFiClientSecure;
+    if (USE_INSECURE_TLS) {
+      w->setInsecure();
+    } else {
+      // production: set root cert
+      w->setCACert(TLS_PRODUCTION_CERT);
+    }
+    wcs = w;
+    if (!http.begin(*wcs, apiUrl)) {
+      Serial.println("HTTPS begin failed");
+      delete wcs;
+      return "[]";
+    }
+  } else {
+    WiFiClient *w = new WiFiClient;
+    wc = w;
+    if (!http.begin(*wc, apiUrl)) {
+      Serial.println("HTTP begin failed");
+      delete wc;
+      return "[]";
+    }
+  }
+
+  http.addHeader("Authorization", "Bearer " + getPrefString(KEY_API_KEY, ""));
+  int code = http.GET();
+  if (code <= 0) {
+    Serial.printf("HTTP GET failed, error: %d\n", code);
+    http.end();
+    if (wcs) { delete wcs; } if (wc) { delete wc; }
+    return "[]";
+  }
+  String payload = http.getString();
+  http.end();
+  if (wcs) delete wcs;
+  if (wc) delete wc;
+
+  // Airtable returns { "records":[ ... ] } - normalize
+  DynamicJsonDocument doc(30 * 1024);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.println("Failed to parse company JSON");
+    Serial.println(payload.substring(0, min((int)payload.length(), 200)));
+    return "[]";
+  }
+  JsonArray records = doc["records"].as<JsonArray>();
+  if (records.isNull()) return "[]";
+
+  // Build normalized array
+  DynamicJsonDocument outDoc(30 * 1024);
+  JsonArray outArr = outDoc.to<JsonArray>();
+  for (JsonObject rec : records) {
+    JsonObject fields = rec["fields"];
+    if (fields.isNull()) continue;
+    JsonObject norm = outArr.createNestedObject();
+    norm["id"] = rec["id"] | "";
+    norm["name"] = fields["name"] | "";
+    // ingredients may be stored as string containing JSON
+    String ingrRaw;
+    if (fields.containsKey("ingredients")) {
+      if (fields["ingredients"].is<const char*>()) {
+        ingrRaw = String(fields["ingredients"].as<const char*>());
+      } else {
+        // if Airtable allowed array maybe it's direct
+        // try to copy raw marshalled
+        String tmp;
+        serializeJson(fields["ingredients"], tmp);
+        ingrRaw = tmp;
+      }
+    }
+    // parse ingredients JSON if possible
+    JsonArray ingrArr = outDoc.createNestedArray();
+    if (ingrRaw.length()) {
+      // try parsing
+      DynamicJsonDocument ingrDoc(8 * 1024);
+      if (deserializeJson(ingrDoc, ingrRaw) == DeserializationError::Ok) {
+        JsonArray parsed = ingrDoc.as<JsonArray>();
+        for (JsonObject it : parsed) {
+          JsonObject ni = ingrArr.createNestedObject();
+          ni["name"] = it["name"] | "";
+          ni["weight"] = it["weight"] | 0;
+          ni["calories"] = it["calories"] | 0;
+        }
+      } else {
+        // failed to parse - leave empty
+      }
+    }
+    norm["ingredients"] = ingrArr;
+    norm["serving_size"] = fields["serving_size"] | 1;
+    int sl = fields["speed_level"] | 0;
+    if (sl < 1 || sl > 3) sl = 1; // coerce
+    norm["speed_level"] = sl;
+    norm["timer"] = fields["timer"] | 30;
+  }
+
+  String outStr;
+  serializeJson(outArr, outStr);
+
+  // cache
+  companyCacheJson = outStr;
+  lastCompanyFetchMs = millis();
+  return outStr;
+}
+
+/* =================== RECIPES: local load/save =================== */
+
+String getLocalRecipesJson() {
+  ensureSpiffs();
+  String s = atomicReadFile(LOCAL_RECIPES);
+  // validate
+  DynamicJsonDocument tmp(8 * 1024);
+  if (deserializeJson(tmp, s) != DeserializationError::Ok) {
+    Serial.println("Local recipes corrupt or missing, recreating");
+    atomicWriteFile(LOCAL_RECIPES, "[]");
+    return "[]";
+  }
+  return s;
+}
+
+bool addLocalRecipeFromJson(const String &recipeJson) {
+  // parse recipeJson as object
+  DynamicJsonDocument newDoc(10 * 1024);
+  if (deserializeJson(newDoc, recipeJson) != DeserializationError::Ok) {
+    Serial.println("Invalid recipe JSON");
+    return false;
+  }
+  JsonObject newRec = newDoc.as<JsonObject>();
+
+  // ensure required fields and sanitize
+  String name = newRec["name"] | "";
+  if (name.length() == 0) { Serial.println("Recipe name empty"); return false; }
+  int speed_level = newRec["speed_level"] | 1;
+  if (speed_level < 1 || speed_level > 3) speed_level = 1;
+  int timer = newRec["timer"] | 30;
+
+  // load existing
+  String cur = getLocalRecipesJson();
+  DynamicJsonDocument doc(30 * 1024);
+  deserializeJson(doc, cur);
+  JsonArray arr = doc.as<JsonArray>();
+  // generate ID
+  String id = String(millis()) + String(random(1000, 9999));
+  JsonObject rec = arr.createNestedObject();
+  rec["id"] = id;
+  rec["name"] = name;
+  rec["speed_level"] = speed_level;
+  rec["timer"] = timer;
+  rec["serving_size"] = newRec["serving_size"] | 1;
+  // ingredients copy
+  JsonArray ingrOut = rec.createNestedArray("ingredients");
+  if (newRec.containsKey("ingredients") && newRec["ingredients"].is<JsonArray>()) {
+    for (JsonObject it : newRec["ingredients"].as<JsonArray>()) {
+      JsonObject o = ingrOut.createNestedObject();
+      o["name"] = it["name"] | "";
+      o["weight"] = it["weight"] | 0;
+      o["calories"] = it["calories"] | 0;
+    }
+  } else {
+    // optional: accept fields that are text
+  }
+  // write back
+  String out;
+  serializeJson(arr, out);
+  return atomicWriteFile(LOCAL_RECIPES, out);
+}
+
+bool deleteLocalRecipeById(const String &id) {
+  String cur = getLocalRecipesJson();
+  DynamicJsonDocument doc(30 * 1024);
+  deserializeJson(doc, cur);
+  JsonArray arr = doc.as<JsonArray>();
+  DynamicJsonDocument outDoc(30 * 1024);
+  JsonArray outArr = outDoc.to<JsonArray>();
+  bool found = false;
+  for (JsonObject rec : arr) {
+    String rid = rec["id"] | "";
+    if (rid == id) {
+      found = true;
+      continue;
+    }
+    JsonObject nr = outArr.createNestedObject();
+    nr.set(rec);
+  }
+  if (!found) return false;
+  String out; serializeJson(outArr, out);
+  return atomicWriteFile(LOCAL_RECIPES, out);
+}
+
+/* =================== GPIO CONTROL =================== */
+
+void setAllOff() {
+  digitalWrite(PIN_SPEED1, LOW);
+  digitalWrite(PIN_SPEED2, LOW);
+  digitalWrite(PIN_SPEED3, LOW);
+  activeSpeed = 0;
+  runInProgress = false;
+  runUntilMs = 0;
+}
+
+void setSpeed(int s) {
+  // cancel existing run and set new
+  if (s < 0) s = 0;
+  setAllOff();
+  if (s == 1) digitalWrite(PIN_SPEED1, HIGH);
+  else if (s == 2) digitalWrite(PIN_SPEED2, HIGH);
+  else if (s == 3) digitalWrite(PIN_SPEED3, HIGH);
+  activeSpeed = s;
+}
+
+/* Start timed run */
+void startTimedRun(int speed, unsigned long seconds) {
+  if (speed < 1 || speed > 3) return;
+  setAllOff();
+  setSpeed(speed);
+  runInProgress = true;
+  runUntilMs = millis() + seconds * 1000UL;
+}
+
+/* =================== NETWORK / SERVER ENDPOINTS =================== */
+
+bool checkPinHeader(AsyncWebServerRequest *request) {
+  String pin = getPrefString(KEY_DEVICE_PIN, "");
+  if (pin.length() == 0) return true; // no pin set
+  if (!request->hasHeader("X-Device-PIN")) return false;
+  AsyncWebHeader* h = request->getHeader("X-Device-PIN");
+  return (h->value() == pin);
+}
+
+void handleApiState(AsyncWebServerRequest *request) {
+  DynamicJsonDocument d(1024);
+  d["mode"] = runInProgress ? "running" : "idle";
+  d["activeSpeed"] = activeSpeed;
+  long remaining = 0;
+  if (runInProgress && runUntilMs > millis()) remaining = (runUntilMs - millis()) / 1000;
+  d["remainingSeconds"] = remaining;
+  String out; serializeJson(d, out);
+  request->send(200, "application/json", out);
+}
+
+void handlePostSpeed(AsyncWebServerRequest *request) {
+  if (!checkPinHeader(request)) { request->send(401, "application/json", "{\"error\":\"PIN required\"}"); return; }
+  if (!request->hasParam("body", true)) { request->send(400, "application/json", "{\"error\":\"missing body\"}"); return; }
+  String body = request->getParam("body", true)->value();
+  DynamicJsonDocument d(1024);
+  if (deserializeJson(d, body) != DeserializationError::Ok) { request->send(400, "application/json", "{\"error\":\"invalid json\"}"); return; }
+  int speed = d["speed"] | 0;
+  if (speed < 0 || speed > 3) { request->send(400, "application/json", "{\"error\":\"speed invalid\"}"); return; }
+  if (speed == 0) {
+    setAllOff();
+    request->send(200, "application/json", "{\"status\":\"off\"}");
+    return;
+  } else {
+    // immediate switch (cancel timers)
+    setSpeed(speed);
+    runInProgress = false;
+    runUntilMs = 0;
+    request->send(200, "application/json", "{\"status\":\"ok\"}");
+    return;
+  }
+}
+
+void handleGetLocalRecipes(AsyncWebServerRequest *request) {
+  String s = getLocalRecipesJson();
+  request->send(200, "application/json", s);
+}
+
+void handlePostAddLocalRecipe(AsyncWebServerRequest *request) {
+  if (!checkPinHeader(request)) { request->send(401, "application/json", "{\"error\":\"PIN required\"}"); return; }
+  if (!request->hasParam("body", true)) { request->send(400, "application/json", "{\"error\":\"missing body\"}"); return; }
+  String body = request->getParam("body", true)->value();
+  bool ok = addLocalRecipeFromJson(body);
+  if (!ok) { request->send(500, "application/json", "{\"error\":\"save failed\"}"); return; }
+  request->send(200, "application/json", "{\"status\":\"saved\"}");
+}
+
+void handlePostDeleteLocalRecipe(AsyncWebServerRequest *request) {
+  if (!checkPinHeader(request)) { request->send(401, "application/json", "{\"error\":\"PIN required\"}"); return; }
+  if (!request->hasParam("body", true)) { request->send(400, "application/json", "{\"error\":\"missing body\"}"); return; }
+  String body = request->getParam("body", true)->value();
+  DynamicJsonDocument d(1024);
+  if (deserializeJson(d, body) != DeserializationError::Ok) { request->send(400, "application/json", "{\"error\":\"invalid json\"}"); return; }
+  String id = d["id"] | "";
+  if (id.length() == 0) { request->send(400, "application/json", "{\"error\":\"missing id\"}"); return; }
+  bool ok = deleteLocalRecipeById(id);
+  if (!ok) { request->send(404, "application/json", "{\"error\":\"not found\"}"); return; }
+  request->send(200, "application/json", "{\"status\":\"deleted\"}");
+}
+
+void handlePostRunRecipe(AsyncWebServerRequest *request) {
+  if (!checkPinHeader(request)) { request->send(401, "application/json", "{\"error\":\"PIN required\"}"); return; }
+  if (!request->hasParam("body", true)) { request->send(400, "application/json", "{\"error\":\"missing body\"}"); return; }
+  String body = request->getParam("body", true)->value();
+  DynamicJsonDocument d(2048);
+  if (deserializeJson(d, body) != DeserializationError::Ok) { request->send(400, "application/json", "{\"error\":\"invalid json\"}"); return; }
+  int speed = d["speed_level"] | 0;
+  int timer = d["timer"] | 0;
+  if (speed < 1 || speed > 3 || timer <= 0) { request->send(400, "application/json", "{\"error\":\"invalid parameters\"}"); return; }
+  // start run
+  startTimedRun(speed, (unsigned long)timer);
+  request->send(200, "application/json", "{\"status\":\"running\"}");
+}
+
+void handleGetCompanyList(AsyncWebServerRequest *request) {
+  unsigned long now = millis();
+  if (now - lastCompanyFetchMs < COMPANY_CACHE_TTL_MS && companyCacheJson.length()) {
+    request->send(200, "application/json", companyCacheJson);
+    return;
+  }
+  String out = fetchCompanyRecipes();
+  if (out.length() == 0) out = "[]";
+  request->send(200, "application/json", out);
+}
+
+/* Settings endpoints */
+void handlePostSaveSettings(AsyncWebServerRequest *request) {
+  if (!checkPinHeader(request)) { request->send(401, "application/json", "{\"error\":\"PIN required\"}"); return; }
+  if (!request->hasParam("body", true)) { request->send(400, "application/json", "{\"error\":\"missing body\"}"); return; }
+  String body = request->getParam("body", true)->value();
+  DynamicJsonDocument d(8 * 1024);
+  if (deserializeJson(d, body) != DeserializationError::Ok) { request->send(400, "application/json", "{\"error\":\"invalid json\"}"); return; }
+  String apiUrl = d["api_url"] | "";
+  String apiKey = d["api_key"] | "";
+  String allowed = d["allowed_domain"] | DEFAULT_ALLOWED_DOMAIN;
+  String pin = d["device_pin"] | "";
+  setPrefString(KEY_API_URL, apiUrl);
+  setPrefString(KEY_API_KEY, apiKey);
+  setPrefString(KEY_ALLOWED_DOMAIN, allowed);
+  setPrefString(KEY_DEVICE_PIN, pin);
+  request->send(200, "application/json", "{\"status\":\"saved\"}");
+}
+
+void handlePostTestApi(AsyncWebServerRequest *request) {
+  if (!checkPinHeader(request)) { request->send(401, "application/json", "{\"error\":\"PIN required\"}"); return; }
+  String res = fetchCompanyRecipes();
+  if (res.length() == 0) request->send(500, "application/json", "{\"error\":\"fetch failed\"}");
+  else request->send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void handleGetLocalRecipes(AsyncWebServerRequest *request) {
+  String s = getLocalRecipesJson();
+  request->send(200, "application/json", s);
+}
+
+void handlePostAddLocalRecipe(AsyncWebServerRequest *request) {
+  if (!checkPinHeader(request)) { request->send(401, "application/json", "{\"error\":\"PIN required\"}"); return; }
+  if (!request->hasParam("body", true)) { request->send(400, "application/json", "{\"error\":\"missing body\"}"); return; }
+  String body = request->getParam("body", true)->value();
+  bool ok = addLocalRecipeFromJson(body);
+  if (!ok) { request->send(500, "application/json", "{\"error\":\"save failed\"}"); return; }
+  request->send(200, "application/json", "{\"status\":\"saved\"}");
+}
+
+void handlePostDeleteLocalRecipe(AsyncWebServerRequest *request) {
+  if (!checkPinHeader(request)) { request->send(401, "application/json", "{\"error\":\"PIN required\"}"); return; }
+  if (!request->hasParam("body", true)) { request->send(400, "application/json", "{\"error\":\"missing body\"}"); return; }
+  String body = request->getParam("body", true)->value();
+  DynamicJsonDocument d(1024);
+  if (deserializeJson(d, body) != DeserializationError::Ok) { request->send(400, "application/json", "{\"error\":\"invalid json\"}"); return; }
+  String id = d["id"] | "";
+  if (id.length() == 0) { request->send(400, "application/json", "{\"error\":\"missing id\"}"); return; }
+  bool ok = deleteLocalRecipeById(id);
+  if (!ok) { request->send(404, "application/json", "{\"error\":\"not found\"}"); return; }
+  request->send(200, "application/json", "{\"status\":\"deleted\"}");
+}
+
+void handlePostRunRecipe(AsyncWebServerRequest *request) {
+  if (!checkPinHeader(request)) { request->send(401, "application/json", "{\"error\":\"PIN required\"}"); return; }
+  if (!request->hasParam("body", true)) { request->send(400, "application/json", "{\"error\":\"missing body\"}"); return; }
+  String body = request->getParam("body", true)->value();
+  DynamicJsonDocument d(2048);
+  if (deserializeJson(d, body) != DeserializationError::Ok) { request->send(400, "application/json", "{\"error\":\"invalid json\"}"); return; }
+  int speed = d["speed_level"] | 0;
+  int timer = d["timer"] | 0;
+  if (speed < 1 || speed > 3 || timer <= 0) { request->send(400, "application/json", "{\"error\":\"invalid parameters\"}"); return; }
+  // start run
+  startTimedRun(speed, (unsigned long)timer);
+  request->send(200, "application/json", "{\"status\":\"running\"}");
+}
+
+void handleGetCompanyList(AsyncWebServerRequest *request) {
+  unsigned long now = millis();
+  if (now - lastCompanyFetchMs < COMPANY_CACHE_TTL_MS && companyCacheJson.length()) {
+    request->send(200, "application/json", companyCacheJson);
+    return;
+  }
+  String out = fetchCompanyRecipes();
+  if (out.length() == 0) out = "[]";
+  request->send(200, "application/json", out);
+}
+
+/* Settings endpoints */
+void handlePostSaveSettings(AsyncWebServerRequest *request) {
+  if (!checkPinHeader(request)) { request->send(401, "application/json", "{\"error\":\"PIN required\"}"); return; }
+  if (!request->hasParam("body", true)) { request->send(400, "application/json", "{\"error\":\"missing body\"}"); return; }
+  String body = request->getParam("body", true)->value();
+  DynamicJsonDocument d(8 * 1024);
+  if (deserializeJson(d, body) != DeserializationError::Ok) { request->send(400, "application/json", "{\"error\":\"invalid json\"}"); return; }
+  String apiUrl = d["api_url"] | "";
+  String apiKey = d["api_key"] | "";
+  String allowed = d["allowed_domain"] | DEFAULT_ALLOWED_DOMAIN;
+  String pin = d["device_pin"] | "";
+  setPrefString(KEY_API_URL, apiUrl);
+  setPrefString(KEY_API_KEY, apiKey);
+  setPrefString(KEY_ALLOWED_DOMAIN, allowed);
+  setPrefString(KEY_DEVICE_PIN, pin);
+  request->send(200, "application/json", "{\"status\":\"saved\"}");
+}
+
+void handlePostTestApi(AsyncWebServerRequest *request) {
+  if (!checkPinHeader(request)) { request->send(401, "application/json", "{\"error\":\"PIN required\"}"); return; }
+  String res = fetchCompanyRecipes();
+  if (res.length() == 0) request->send(500, "application/json", "{\"error\":\"fetch failed\"}");
+  else request->send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void handlePostFactoryReset(AsyncWebServerRequest *request) {
+  if (!checkPinHeader(request)) { request->send(401, "application/json", "{\"error\":\"PIN required\"}"); return; }
+  // wipe NVS and SPIFFS
+  prefs.begin(PREF_NAMESPACE, false);
+  prefs.clear();
+  prefs.end();
+  // remove files
+  if (SPIFFS.exists(LOCAL_RECIPES)) SPIFFS.remove(LOCAL_RECIPES);
+  // restart
+  request->send(200, "application/json", "{\"status\":\"resetting\"}");
+  delay(200);
+  ESP.restart();
+}
+
+/* =================== SIMPLE EMBEDDED UI (HTML/CSS/JS) =================== */
+
+/* Note: keep UI small and embedded. The UI will call local REST endpoints above.
+   For brevity the UI is minimal but clean. You can edit it or externalize files later.
+*/
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Recipes</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:0;padding:0;background:#f7f7f8;color:#111}
+.header{background:#0b79d0;color:white;padding:12px;display:flex;align-items:center}
+.hamb{font-size:24px;margin-right:12px;cursor:pointer}
+.title{font-weight:bold}
+.container{padding:12px}
+.card{background:white;border-radius:8px;padding:12px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,0.08)}
+.button{display:inline-block;padding:10px 14px;border-radius:6px;margin:6px 6px 0 0;border:none;cursor:pointer}
+.btn-primary{background:#0b79d0;color:white}
+.btn-quiet{background:#e9eef5;color:#0b79d0}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+.small{font-size:12px;color:#666}
+.toggle{padding:10px 18px;border-radius:8px;border:1px solid #ddd;background:white}
+.progress{height:8px;background:#eee;border-radius:6px;margin-top:8px;overflow:hidden}
+.progress > div{height:8px;background:#0b79d0;width:0%}
+.hidden{display:none}
+.menu{position:fixed;left:0;top:0;bottom:0;width:260px;background:#fff;box-shadow:2px 0 6px rgba(0,0,0,0.12);transform:translateX(-280px);transition:transform .2s;padding:12px}
+.menu.open{transform:translateX(0)}
+.menu a{display:block;padding:10px 6px;color:#0b79d0;text-decoration:none}
+.footer{padding:10px;color:#999;font-size:12px}
+input[type="text"],input[type="number"],textarea{width:100%;padding:8px;border-radius:6px;border:1px solid #ddd;margin-top:6px}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="hamb" onclick="toggleMenu()">☰</div>
+  <div class="title">ESP32 Recipes</div>
+</div>
+
+<div id="menu" class="menu">
+  <a href="#" onclick="nav('home')">Home</a>
+  <a href="#" onclick="nav('my')">My Recipes</a>
+  <a href="#" onclick="nav('company')">Company Recipes</a>
+  <a href="#" onclick="nav('settings')">Settings</a>
+  <div class="footer">Device UI</div>
+</div>
+
+<div id="main" class="container">
+  <div id="page-home" class="page">
+    <div class="card">
+      <div><strong>Control</strong></div>
+      <div class="row" style="margin-top:8px">
+        <button class="button toggle" id="btn-off" onclick="setSpeed(0)">Off</button>
+        <button class="button toggle" id="btn-1" onclick="setSpeed(1)">Speed 1</button>
+        <button class="button toggle" id="btn-2" onclick="setSpeed(2)">Speed 2</button>
+        <button class="button toggle" id="btn-3" onclick="setSpeed(3)">Speed 3</button>
+      </div>
+      <div id="state" class="small" style="margin-top:8px">Loading state...</div>
+      <div id="progressArea" class="hidden">
+        <div class="progress"><div id="prog"></div></div>
+      </div>
+      <div style="margin-top:8px"><button class="button btn-quiet" onclick="stopNow()">Stop Now</button></div>
+    </div>
+  </div>
+
+  <div id="page-my" class="page hidden">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div><strong>My Recipes</strong></div>
+      <div><button class="button btn-primary" onclick="showAddForm()">Add New</button></div>
+    </div>
+    <div id="myList" style="margin-top:10px"></div>
+
+    <div id="addForm" class="card hidden">
+      <div><strong>New Recipe</strong></div>
+      <div style="margin-top:8px">
+        <label>Name</label><input id="r_name" type="text">
+        <label>Ingredients (JSON array)</label><textarea id="r_ingredients" rows=4 placeholder='[{"name":"X","weight":100,"calories":50}]'></textarea>
+        <label>Serving Size</label><input id="r_serving" type="number" value="1">
+        <label>Speed Level (1/2/3)</label><input id="r_speed" type="number" value="1">
+        <label>Timer (seconds)</label><input id="r_timer" type="number" value="30">
+        <div style="margin-top:8px"><button class="button btn-primary" onclick="saveNewRecipe()">Save</button> <button class="button btn-quiet" onclick="hideAddForm()">Cancel</button></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="page-company" class="page hidden">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div><strong>Company Recipes</strong></div>
+      <div><button class="button btn-primary" onclick="fetchCompany()">Refresh</button></div>
+    </div>
+    <div id="companyList" style="margin-top:10px"></div>
+  </div>
+  <div id="page-settings" class="page hidden">
+    <div class="card"><strong>Settings</strong>
+      <div style="margin-top:8px">
+        <label>API URL</label><input id="s_api" type="text" placeholder="https://api.airtable.com/v0/BASE/recipes?pageSize=50">
+        <label>API Key</label><input id="s_key" type="text" placeholder="Paste API key">
+        <label>Allowed Domain</label><input id="s_domain" type="text" placeholder="api.airtable.com">
+        <label>Device PIN (optional)</label><input id="s_pin" type="text" placeholder="1234">
+        <div style="margin-top:8px"><button class="button btn-primary" onclick="saveSettings()">Save</button> <button class="button btn-quiet" onclick="testApi()">Test API</button> <button class="button" onclick="factoryReset()">Factory Reset</button></div>
+        <div id="settingsMsg" class="small" style="margin-top:8px"></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let currentPage = 'home';
+function toggleMenu(){document.getElementById('menu').classList.toggle('open');}
+function nav(p){
+  currentPage = p;
+  document.querySelectorAll('.page').forEach(e=>e.classList.add('hidden'));
+  document.getElementById('page-'+p).classList.remove('hidden');
+  toggleMenu();
+  if (p==='my') loadMy();
+  if (p==='company') fetchCompany();
+}
+
+async function api(path, method='GET', body=null){
+  let opts={method};
+  if (body) { opts.body = JSON.stringify(body); opts.headers={'Content-Type':'application/json'};}
+  let res = await fetch('/api'+path, opts);
+  return res;
+}
+
+/* Home controls */
+async function refreshState(){
+  try {
+    let r = await api('/state'); let j = await r.json();
+    let s = j.mode==='running' ? 'Running Speed ' + j.activeSpeed + ' (remaining ' + j.remainingSeconds + 's)' : 'All Off';
+    document.getElementById('state').innerText = s;
+    // show progress
+    if (j.mode==='running'){
+      document.getElementById('progressArea').classList.remove('hidden');
+      let total = 60; // rough default for progress UI; real progress requires server to return total
+      let pct = 100 * (1 - (j.remainingSeconds / (j.remainingSeconds + 0.0001)));
+      document.getElementById('prog').style.width = Math.min(100, pct) + '%';
+    } else {
+      document.getElementById('progressArea').classList.add('hidden');
+    }
+  } catch(e){ console.log(e); }
+}
+setInterval(refreshState, 1000);
+refreshState();
+
+function setActiveButtons(speed){
+  ['btn-off','btn-1','btn-2','btn-3'].forEach(id=>document.getElementById(id).style.borderColor='#ddd');
+  if (speed===0) document.getElementById('btn-off').style.borderColor='#0b79d0';
+  else document.getElementById('btn-'+speed).style.borderColor='#0b79d0';
+}
+async function setSpeed(s){
+  try {
+    let r = await api('/speed', 'POST', {speed:s});
+    await refreshState();
+  } catch(e){ console.log(e); }
+}
+async function stopNow(){ await setSpeed(0); }
+
+/* My recipes */
+function showAddForm(){ document.getElementById('addForm').classList.remove('hidden'); }
+function hideAddForm(){ document.getElementById('addForm').classList.add('hidden'); }
+
+async function saveNewRecipe(){
+  let name = document.getElementById('r_name').value;
+  let ingredients = document.getElementById('r_ingredients').value;
+  let serving = Number(document.getElementById('r_serving').value);
+  let speed = Number(document.getElementById('r_speed').value);
+  let timer = Number(document.getElementById('r_timer').value);
+  if (!name || !ingredients) { alert('Name and ingredients required'); return; }
+  let payload = {name:name, ingredients: JSON.parse(ingredients), serving_size:serving, speed_level:speed, timer:timer};
+  let r = await api('/recipes/local/add','POST', payload);
+  if (r.status===200) { alert('Saved'); hideAddForm(); loadMy(); }
+  else alert('Save failed');
+}
+
+async function loadMy(){
+  let r = await api('/recipes/local'); if (r.status!==200) { document.getElementById('myList').innerHTML='<div class="card small">No recipes</div>'; return; }
+  let arr = await r.json();
+  let html = '';
+  arr.forEach(rec=>{
+    let totalCalories = 0;
+    if (rec.ingredients) rec.ingredients.forEach(i=> totalCalories += (i.calories||0));
+    html += `<div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><div><strong>${rec.name}</strong><div class="small">Total calories: ${totalCalories}</div></div><div><button class="button btn-primary" onclick='runLocal("${rec.id}", ${rec.speed_level}, ${rec.timer})'>Run</button> <button class="button btn-quiet" onclick='delLocal("${rec.id}")'>Delete</button></div></div>`;
+    html += `<div style="margin-top:8px" id="detail-${rec.id}"><small>Serving: ${rec.serving_size||1}</small><pre class="small">${JSON.stringify(rec.ingredients, null, 2)}</pre></div></div>`;
+  });
+  document.getElementById('myList').innerHTML = html;
+}
+
+async function runLocal(id, speed, timer){
+  let r = await api('/recipes/run','POST',{speed_level:speed, timer:timer});
+  if (r.status===200) alert('Running');
+  else alert('Failed to start');
+}
+
+async function delLocal(id){
+  if (!confirm('Delete recipe?')) return;
+  let r = await api('/recipes/local/delete','POST',{id:id});
+  if (r.status===200) loadMy(); else alert('Delete failed');
+}
+
+/* Company */
+async function fetchCompany(){
+  document.getElementById('companyList').innerHTML = '<div class="card small">Loading...</div>';
+  let r = await api('/company/list');
+  if (r.status!==200) { document.getElementById('companyList').innerHTML='<div class="card small">Fetch failed</div>'; return; }
+  let arr = await r.json();
+  let html = '';
+  arr.forEach(rec=>{
+    let totalCalories = 0;
+    if (rec.ingredients) rec.ingredients.forEach(i=> totalCalories += (i.calories||0));
+    html += `<div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><div><strong>${rec.name}</strong><div class="small">Total calories: ${totalCalories}</div></div><div><button class="button btn-primary" onclick='runCompany(${rec.speed_level}, ${rec.timer})'>Run Now</button> <button class="button btn-quiet" onclick='addCompany(${encodeURIComponent(JSON.stringify(rec))})'>Add to My</button></div></div>`;
+    html += `<div style="margin-top:8px"><pre class="small">${JSON.stringify(rec.ingredients||[], null, 2)}</pre></div></div>`;
+  });
+  document.getElementById('companyList').innerHTML = html;
+}
+
+async function runCompany(speed, timer){
+  let r = await api('/recipes/run','POST',{speed_level:speed, timer:timer});
+  if (r.status===200) alert('Running'); else alert('Failed');
+}
+
+async function addCompany(recJsonEsc){
+  let recJson = decodeURIComponent(recJsonEsc);
+  let r = await api('/recipes/local/add','POST', JSON.parse(recJson));
+  if (r.status===200) { alert('Saved'); } else alert('Save failed');
+}
+
+/* Settings */
+async function saveSettings(){
+  let url = document.getElementById('s_api').value;
+  let key = document.getElementById('s_key').value;
+  let dom = document.getElementById('s_domain').value;
+  let pin = document.getElementById('s_pin').value;
+  let r = await api('/settings/save','POST',{api_url:url, api_key:key, allowed_domain:dom, device_pin:pin});
+  let txt = (r.status===200) ? 'Saved' : 'Failed';
+  document.getElementById('settingsMsg').innerText = txt;
+}
+
+async function testApi(){
+  let r = await api('/settings/test','POST',{});
+  let txt = (r.status===200) ? 'OK' : 'Failed';
+  document.getElementById('settingsMsg').innerText = txt;
+}
+
+async function factoryReset(){
+  if (!confirm('Type RESET to confirm')) return;
+  let r = await api('/settings/factory_reset','POST', {});
+  alert('Resetting');
+}
+
+/* on load: show settings defaults */
+async function loadSettings(){
+  try {
+    // try to fetch via endpoint for convenience (not implemented in minimal server)
+  } catch(e){}
+}
+
+nav('home');
+</script>
+</body>
+</html>
+)rawliteral";
+
+/* =================== SETUP & LOOP =================== */
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  randomSeed(analogRead(0));
+
+  pinMode(PIN_SPEED1, OUTPUT);
+  pinMode(PIN_SPEED2, OUTPUT);
+  pinMode(PIN_SPEED3, OUTPUT);
+  setAllOff();
+
+  // SPIFFS
+  ensureSpiffs();
+  // ensure local recipes file exists
+  if (!SPIFFS.exists(LOCAL_RECIPES)) {
+    atomicWriteFile(LOCAL_RECIPES, "[]");
+  }
+
+  // preferences init
+  prefs.begin(PREF_NAMESPACE, false);
+
+  // Try to connect using saved Wi-Fi credentials using WiFiManager
+  WiFi.mode(WIFI_STA);
+  bool res = wm.autoConnect("ESP32_Setup", "configureme"); // blocks until configured or timed out
+  // If autoConnect returns true, we are connected; if false, it started AP and returns when configured.
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Connected to WiFi via WiFiManager");
+  } else {
+    // WiFiManager will block showing AP until configured
+    Serial.println("WiFiManager AP mode; waiting for config...");
+  }
+
+  // after configuration, get IP
+  deviceIp = WiFi.localIP().toString();
+  Serial.print("Device IP: "); Serial.println(deviceIp);
+
+  // mDNS
+  if (MDNS.begin("esp32")) {
+    Serial.println("mDNS responder started: http://esp32.local");
+    mDNSStarted = true;
+  }
+
+  // start webserver (Async)
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+
+  // Static assets (none external); endpoints
+  server.on("/api/state", HTTP_GET, [](AsyncWebServerRequest *request){ handleApiState(request); });
+  server.on("/api/speed", HTTP_POST, [](AsyncWebServerRequest *request){ handlePostSpeed(request); });
+  server.on("/api/recipes/local", HTTP_GET, [](AsyncWebServerRequest *request){ handleGetLocalRecipes(request); });
+  server.on("/api/recipes/local/add", HTTP_POST, [](AsyncWebServerRequest *request){ handlePostAddLocalRecipe(request); });
+  server.on("/api/recipes/local/delete", HTTP_POST, [](AsyncWebServerRequest *request){ handlePostDeleteLocalRecipe(request); });
+  server.on("/api/recipes/run", HTTP_POST, [](AsyncWebServerRequest *request){ handlePostRunRecipe(request); });
+  server.on("/api/company/list", HTTP_GET, [](AsyncWebServerRequest *request){ handleGetCompanyList(request); });
+  server.on("/api/settings/save", HTTP_POST, [](AsyncWebServerRequest *request){ handlePostSaveSettings(request); });
+  server.on("/api/settings/test", HTTP_POST, [](AsyncWebServerRequest *request){ handlePostTestApi(request); });
+  server.on("/api/settings/factory_reset", HTTP_POST, [](AsyncWebServerRequest *request){ handlePostFactoryReset(request); });
+  // fallback 404
+  server.onNotFound([](AsyncWebServerRequest *request){
+    request->send(404, "text/plain", "Not found");
+  });
+
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  // non-blocking timer check
+  if (runInProgress && runUntilMs > 0 && millis() >= runUntilMs) {
+    setAllOff();
+    Serial.println("Timed run complete, all off.");
+  }
+
+  // minimal housekeeping - can be extended
+  delay(10);
+}
