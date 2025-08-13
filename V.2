@@ -1,0 +1,226 @@
+IMPLEMENTATION GUIDE (step-by-step, nothing assumed)
+
+A) Company Side (Airtable = admin UI + API with no code)
+
+1. Create Airtable account → airtable.com (free plan is fine).
+
+
+2. Create a Base named “Recipes”. Inside it create a Table named recipes.
+
+
+3. Make these Fields (column names, exact spellings):
+
+name → Single line text
+
+ingredients → Long text (paste JSON array here, example below)
+
+serving_size → Number (integer)
+
+speed_level → Number (integer; allowed values 1,2,3)
+
+timer → Number (integer; seconds)
+
+
+
+4. Add a few rows. For ingredients, paste JSON like:
+
+[
+  {"name":"Banana","weight":120,"calories":105},
+  {"name":"Milk","weight":200,"calories":103}
+]
+
+
+5. Get your Personal Access Token (API key):
+
+Airtable → Account → Developer hub → Personal access tokens → Create token.
+
+Give it read access to your “Recipes” base. Copy the token (keep it secret).
+
+
+
+6. Find your Base ID and Table Name:
+
+Open the base, click the “API” help or use the Developer hub to find BASE_ID.
+
+Table name is recipes (exact).
+
+
+
+7. Your API URL for listing recipes will be:
+
+https://api.airtable.com/v0/<BASE_ID>/recipes?pageSize=50&view=Grid%20view
+
+(Replace <BASE_ID> with your real one.)
+
+
+8. Keep these three things ready to paste into the ESP32 Settings page later:
+
+API URL (above)
+
+API Key (your personal access token)
+
+Allowed Domain = api.airtable.com
+
+
+
+
+> That’s it. Your staff can edit recipes directly in Airtable’s UI (nice and friendly). The ESP32 will read-only fetch from the API.
+
+
+
+
+---
+
+B) ESP32 Side
+
+1) Install Arduino IDE + Board + Libraries
+
+Arduino IDE 2.x
+
+ESP32 board support: Boards Manager → search “esp32” → install “esp32 by Espressif” (2.x).
+
+Libraries: Sketch → Manage Libraries → install:
+
+WiFiManager by tzapu
+
+ESPAsyncWebServer (and AsyncTCP)
+
+ArduinoJson (v6)
+
+
+(No extra steps for SPIFFS on ESP32; it’s built into the core)
+
+
+2) Wire your outputs
+
+Connect GPIO 25 → your Speed 1 driver
+
+Connect GPIO 26 → your Speed 2 driver
+
+Connect GPIO 27 → your Speed 3 driver
+
+Do not power a motor directly from the ESP32 pin. Use a relay/triac driver.
+
+
+3) Flash the generated code
+
+Select Board: “ESP32 Dev Module” (or the exact DevKit you have).
+
+Select the right port.
+
+Compile & Upload.
+
+
+4) First-time setup (captive portal)
+
+Power the board.
+
+On your phone, connect to Wi-Fi ESP32_Setup (password: configureme).
+
+The portal should pop up; if not, open 192.168.4.1.
+
+Enter your home Wi-Fi SSID and password.
+
+ESP32 reboots and joins your Wi-Fi.
+
+
+5) Open the device UI
+
+On your phone (same Wi-Fi), visit http://esp32.local
+
+If mDNS doesn’t work on your phone, find the device IP from your router or serial monitor and browse http://<that-ip>.
+
+
+
+6) Configure the Company API
+
+Go to Settings in the ESP32 UI.
+
+Paste your API URL (from step A7).
+
+Paste your API Key.
+
+Allowed Domain: api.airtable.com.
+
+(Optional) Set a Device PIN (e.g., 1234) to protect “Run/Save/Delete/Factory Reset/Settings” actions.
+
+Click Save.
+
+Click Test API; you should see “Success” if your Airtable has rows and the token is correct.
+
+
+7) Use it
+
+Company Recipes page → tap Refresh → cards should load.
+
+Tap Run Now to run without saving.
+
+Tap Add to My Recipes to copy it into ESP32 local storage.
+
+My Recipes page → your saved recipes appear.
+
+Home → use Off / Speed 1 / Speed 2 / Speed 3. Only one stays active.
+
+When a recipe runs, it auto-stops after its timer.
+
+
+8) Change Wi-Fi later
+
+If the router changes, ESP32 will fail to join and automatically fall back to AP setup again.
+
+Alternatively, use Settings → Factory Reset (you’ll need to confirm) to erase and re-onboard.
+
+
+
+---
+
+C) Troubleshooting & sanity checks
+
+No recipes showing?
+
+Settings → Test API.
+
+Verify API Key, Base ID, Table name (recipes), Allowed Domain = api.airtable.com.
+
+Ensure you have at least one row in Airtable and that ingredients is valid JSON.
+
+
+Compile errors “missing AsyncTCP / ESPAsyncWebServer”?
+
+Install both libraries; restart Arduino IDE.
+
+
+ESP32 not at esp32.local?
+
+Try the raw IP (from Serial Monitor or router).
+
+Some Androids need an mDNS app; IP always works.
+
+
+Airtable HTTPS certificate issue?
+
+Use the Quickstart (unsafe) TLS mode first (the code will have a USE_INSECURE_TLS flag).
+
+Later, switch to Production (safe) and paste the Airtable root cert string where indicated in the code comments.
+
+
+UI says “PIN required”
+
+Add header X-Device-PIN: 1234 in requests (the built-in UI will handle this automatically once you set it).
+
+
+
+
+---
+
+D) Optional: change backend later (no code rewrite)
+
+If you ever move away from Airtable to a plain JSON file or another service, you’ll only change two things in code (clearly commented in the prompt’s output):
+
+1. The fetch function (URL + headers)
+
+
+2. The normalization function (map remote fields → name, ingredients[], serving_size, speed_level, timer)
+
+
+
