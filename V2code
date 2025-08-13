@@ -1052,10 +1052,10 @@ void setupWebServer() {
     DynamicJsonDocument recipes(8192);
     deserializeJson(recipes, existingJson);
     
-    // Add new recipe
-    JsonArray array = recipes.as<JsonArray>();
-    JsonObject recipe = array.createNestedObject();
-    recipe.set(newRecipe);
+   // Add new recipe
+JsonArray array = recipes.as<JsonArray>();
+JsonObject recipe = array.createNestedObject();
+recipe.set(newRecipe.as<JsonObject>());
     
     // Save back
     String updatedJson;
@@ -1305,9 +1305,6 @@ void setup() {
 }
 
 void loop() {
-  // Handle mDNS
-  MDNS.update();
-  
   // Check if recipe timer has expired (backup to Ticker)
   if (deviceState.running && millis() >= deviceState.runUntil) {
     stopRecipeTimer();
