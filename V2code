@@ -1,1315 +1,463 @@
-/*
- * ESP32 Recipe Controller with Wi-Fi Onboarding & Airtable Integration
- * 
- * INSTALLATION REQUIREMENTS:
- * 1. Arduino IDE with ESP32 package (v2.x): https://docs.espressif.com/projects/arduino-esp32/
- * 2. Required libraries (install via Library Manager):
- *    - WiFiManager by tzapu (v2.0.16-rc.2)
- *    - ESPAsyncWebServer by me-no-dev (v1.2.3) 
- *    - AsyncTCP by me-no-dev (v1.1.1)
- *    - ArduinoJson by Benoit Blanchon (v6.21.3)
- *    - ESP32 Ticker (included with core)
- * 
- * BOARD: ESP32 DevKit V1 (38-pin)
- * 
- * QUICK START:
- * 1. Flash code to ESP32
- * 2. Power on → connect to "ESP32_Setup" WiFi (password: configureme)  
- * 3. Complete WiFi setup in captive portal
- * 4. Visit http://esp32.local (or device IP)
- * 5. Go to Settings → enter Airtable Base URL and API Key → Test API
- * 6. Navigate to Company Recipes → fetch and add recipes locally
- * 
- * AIRTABLE SETUP:
- * - Base URL format: https://api.airtable.com/v0/YOUR_BASE_ID/YOUR_TABLE_NAME
- * - Required fields: name, ingredients (JSON string), serving_size, speed_level (1-3), timer
- * - Sample record in comments below
- */
+// =======================
+// Embedded Web Pages
+// =======================
 
-#include <WiFi.h>
-#include <WiFiManager.h>
-#include <ESPmDNS.h>
-#include <ESPAsyncWebServer.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-#include <ArduinoJson.h>
-#include <Preferences.h>
-#include <SPIFFS.h>
-#include <Ticker.h>
-
-// COMPILE-TIME SECURITY OPTION
-#define USE_INSECURE_TLS true  // Set to false for production with valid certificates
-
-// GPIO PIN ASSIGNMENTS (safe pins, not strapping pins)
-// MODIFY THESE IF YOU NEED DIFFERENT PINS:
-#define PIN_SPEED1 25  // Speed 1 control (active HIGH)
-#define PIN_SPEED2 26  // Speed 2 control (active HIGH)  
-#define PIN_SPEED3 27  // Speed 3 control (active HIGH)
-
-// NETWORK CONFIGURATION
-#define AP_SSID "ESP32_Setup"
-#define AP_PASSWORD "configureme"
-#define DEVICE_HOSTNAME "esp32"
-
-// TIMING CONSTANTS (modify as needed)
-#define API_RATE_LIMIT_MS 3000    // Min 3 seconds between API calls
-#define API_CACHE_DURATION_MS 10000  // Cache API results for 10 seconds
-#define MAX_RECIPE_TIMER 300      // Max recipe run time (5 minutes)
-
-// STORAGE PATHS
-#define RECIPES_FILE "/recipes_local.json"
-#define RECIPES_TEMP "/recipes_local.tmp"
-
-// Global objects
-AsyncWebServer server(80);
-Preferences prefs;
-Ticker recipeTimer;
-
-// State management
-struct DeviceState {
-  bool running = false;
-  int activeSpeed = 0;  // 0=off, 1-3=speed levels
-  unsigned long runUntil = 0;
-  String currentRecipeName = "";
-} deviceState;
-
-// API caching
-struct ApiCache {
-  String lastResponse = "";
-  unsigned long lastFetch = 0;
-  bool isValid = false;
-} apiCache;
-
-unsigned long lastApiCall = 0;
-
-/*
- * SAMPLE AIRTABLE RESPONSE FORMAT:
- * {
- *   "records": [
- *     {
- *       "id": "rec123456789",
- *       "fields": {
- *         "name": "Banana Smoothie",
- *         "ingredients": "[{\"name\":\"Banana\",\"weight\":120,\"calories\":105},{\"name\":\"Milk\",\"weight\":200,\"calories\":103}]",
- *         "serving_size": 1,
- *         "speed_level": 2,
- *         "timer": 30
- *       }
- *     }
- *   ]
- * }
- * 
- * MODIFY FIELD NAMES HERE if your Airtable columns are different:
- */
-#define AIRTABLE_FIELD_NAME "name"
-#define AIRTABLE_FIELD_INGREDIENTS "ingredients" 
-#define AIRTABLE_FIELD_SERVING "serving_size"
-#define AIRTABLE_FIELD_SPEED "speed_level"
-#define AIRTABLE_FIELD_TIMER "timer"
-
-// Root CA for airtable.com (expires 2031) - UPDATE if needed
-const char* airtable_root_ca = \
-"-----BEGIN CERTIFICATE-----\n" \
-"MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw\n" \
-"TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh\n" \
-"cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4\n" \
-"WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu\n" \
-"ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY\n" \
-"MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc\n" \
-"h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+\n" \
-"0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U\n" \
-"A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW\n" \
-"T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH\n" \
-"B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC\n" \
-"B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv\n" \
-"KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn\n" \
-"OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn\n" \
-"jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw\n" \
-"qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI\n" \
-"rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV\n" \
-"HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq\n" \
-"hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL\n" \
-"ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ\n" \
-"3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK\n" \
-"NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5\n" \
-"ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur\n" \
-"TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC\n" \
-"jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc\n" \
-"oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq4\n" \
-"RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA\n" \
-"mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d\n" \
-"emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=\n" \
-"-----END CERTIFICATE-----\n";
-
-// HTML/CSS/JS embedded content
-const char* html_index = R"rawliteral(
+// WiFi setup HTML page
+const char wifiSetupHTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html><head>
-<meta charset="utf-8">
+<html>
+<head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Recipe Controller</title>
+<title>WiFi Setup - Mixer Grinder</title>
 <style>
-* { box-sizing: border-box; }
-body { 
-  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-  margin: 0; padding: 0; background: #f5f5f5; color: #333;
-}
-.navbar { 
-  background: #2c3e50; color: white; padding: 1rem;
-  display: flex; justify-content: space-between; align-items: center;
-}
-.hamburger { 
-  cursor: pointer; font-size: 1.5rem; 
-}
-.nav-menu { 
-  display: none; position: absolute; top: 70px; right: 1rem;
-  background: white; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-  min-width: 200px; z-index: 1000;
-}
-.nav-menu.active { display: block; }
-.nav-menu a { 
-  display: block; padding: 0.8rem 1rem; color: #333; 
-  text-decoration: none; border-bottom: 1px solid #eee;
-}
-.nav-menu a:hover { background: #f8f9fa; }
-.nav-menu a:last-child { border-bottom: none; }
-.container { 
-  max-width: 600px; margin: 2rem auto; padding: 0 1rem;
-}
-.card { 
-  background: white; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-  margin-bottom: 1rem; padding: 1.5rem;
-}
-.speed-buttons { 
-  display: grid; grid-template-columns: 1fr 1fr; gap: 0.8rem; margin-bottom: 1.5rem;
-}
-.btn { 
-  background: #3498db; color: white; border: none; border-radius: 8px;
-  padding: 1rem; font-size: 1rem; cursor: pointer; transition: all 0.2s;
-}
-.btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
-.btn.active { background: #27ae60; }
-.btn.danger { background: #e74c3c; }
-.status { 
-  text-align: center; padding: 1rem; border-radius: 8px; margin-bottom: 1rem;
-  font-weight: 500;
-}
-.status.idle { background: #ecf0f1; color: #7f8c8d; }
-.status.running { background: #d5f4e6; color: #27ae60; }
-.progress-bar { 
-  width: 100%; height: 8px; background: #ecf0f1; border-radius: 4px; overflow: hidden;
-}
-.progress-fill { 
-  height: 100%; background: #27ae60; width: 0%; transition: width 1s linear;
-}
-.toast { 
-  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
-  background: #2c3e50; color: white; padding: 0.8rem 1.5rem; border-radius: 25px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.3); z-index: 2000; display: none;
-}
-.recipe-card { 
-  border: 1px solid #e0e6ed; border-radius: 8px; padding: 1rem; margin-bottom: 0.8rem;
-}
-.recipe-title { font-weight: 600; font-size: 1.1rem; margin-bottom: 0.5rem; }
-.recipe-actions { 
-  display: flex; gap: 0.5rem; margin-top: 0.8rem;
-}
-.btn-sm { padding: 0.5rem 1rem; font-size: 0.9rem; }
-.form-group { margin-bottom: 1rem; }
-.form-group label { display: block; margin-bottom: 0.3rem; font-weight: 500; }
-.form-group input, .form-group select, .form-group textarea { 
-  width: 100%; padding: 0.8rem; border: 1px solid #ddd; border-radius: 6px;
-  font-size: 1rem;
-}
-.ingredients-list { margin-bottom: 1rem; }
-.ingredient-row { 
-  display: flex; gap: 0.5rem; margin-bottom: 0.5rem; align-items: end;
-}
-.ingredient-row input { margin-bottom: 0; }
-.loading { 
-  display: inline-block; width: 16px; height: 16px; border: 2px solid #f3f3f3;
-  border-top: 2px solid #3498db; border-radius: 50%; animation: spin 1s linear infinite;
-}
-@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-@media (max-width: 480px) {
-  .speed-buttons { grid-template-columns: 1fr; }
-  .recipe-actions { flex-direction: column; }
-}
+body { font-family: Arial, sans-serif; background-color: #f8f8f8; }
+.container { max-width: 350px; margin: auto; margin-top: 40px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 0 5px rgba(0,0,0,0.1); }
+input { width: 100%; padding: 10px; margin: 6px 0; box-sizing: border-box; }
+button { padding: 10px; background: #4CAF50; border: none; color: white; width: 100%; border-radius: 4px; font-size: 16px; }
+h2 { text-align: center; }
 </style>
-</head><body>
-
-<nav class="navbar">
-  <h1>Recipe Controller</h1>
-  <div class="hamburger" onclick="toggleNav()">☰</div>
-  <div class="nav-menu" id="navMenu">
-    <a href="/" onclick="showPage('home')">🏠 Home</a>
-    <a href="/" onclick="showPage('recipes')">📝 My Recipes</a> 
-    <a href="/" onclick="showPage('company')">🏢 Company Recipes</a>
-    <a href="/" onclick="showPage('settings')">⚙️ Settings</a>
-  </div>
-</nav>
-
+</head>
+<body>
 <div class="container">
-  <div id="homePage">
-    <div class="card">
-      <div class="status" id="statusDisplay">Loading...</div>
-      <div id="progressContainer" style="display: none;">
-        <div class="progress-bar">
-          <div class="progress-fill" id="progressFill"></div>
-        </div>
-      </div>
-      <div class="speed-buttons">
-        <button class="btn" id="btnOff" onclick="setSpeed(0)">OFF</button>
-        <button class="btn" id="btnSpeed1" onclick="setSpeed(1)">Speed 1</button>
-        <button class="btn" id="btnSpeed2" onclick="setSpeed(2)">Speed 2</button>
-        <button class="btn" id="btnSpeed3" onclick="setSpeed(3)">Speed 3</button>
-      </div>
-      <button class="btn danger" id="stopBtn" onclick="stopRecipe()" style="display: none;">Stop Now</button>
-    </div>
-  </div>
+  <h2>WiFi Setup</h2>
+  <form action="/savewifi" method="POST">
+    <input type="text" name="ssid" placeholder="WiFi SSID" required>
+    <input type="password" name="pass" placeholder="Password" required>
+    <button type="submit">Save & Connect</button>
+  </form>
+</div>
+</body>
+</html>
+)rawliteral";
 
-  <div id="recipesPage" style="display: none;">
-    <div class="card">
-      <h2>My Recipes</h2>
-      <div id="localRecipes">Loading recipes...</div>
-      <button class="btn" onclick="showAddRecipeForm()">+ Add New Recipe</button>
-    </div>
-    
-    <div id="addRecipeForm" class="card" style="display: none;">
-      <h3>Add New Recipe</h3>
-      <form onsubmit="saveRecipe(event)">
-        <div class="form-group">
-          <label>Recipe Name *</label>
-          <input type="text" id="recipeName" required>
-        </div>
-        <div class="form-group">
-          <label>Ingredients</label>
-          <div class="ingredients-list" id="ingredientsList">
-            <div class="ingredient-row">
-              <input type="text" placeholder="Ingredient name" class="ing-name">
-              <input type="number" placeholder="Weight (g)" class="ing-weight" style="max-width: 100px;">
-              <input type="number" placeholder="Calories" class="ing-calories" style="max-width: 100px;">
-              <button type="button" onclick="removeIngredient(this)" class="btn btn-sm danger">×</button>
-            </div>
-          </div>
-          <button type="button" onclick="addIngredient()" class="btn btn-sm">+ Add Ingredient</button>
-        </div>
-        <div class="form-group">
-          <label>Serving Size</label>
-          <input type="number" id="servingSize" min="1" value="1">
-        </div>
-        <div class="form-group">
-          <label>Speed Level</label>
-          <select id="speedLevel">
-            <option value="1">Speed 1</option>
-            <option value="2">Speed 2</option>
-            <option value="3">Speed 3</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Timer (seconds)</label>
-          <input type="number" id="recipeTimer" min="1" max="300" value="30">
-        </div>
-        <button type="submit" class="btn">Save Recipe</button>
-        <button type="button" onclick="cancelAddRecipe()" class="btn" style="background: #95a5a6;">Cancel</button>
-      </form>
-    </div>
-  </div>
+// Main control dashboard page
+const char indexHTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart Mixer Grinder</title>
+<style>
+body { font-family: Arial, sans-serif; background: #f0f2f5; margin: 0; }
+header { background: #4CAF50; color: white; padding: 15px; font-size: 20px; text-align: center; }
+.menu { background: #333; overflow: hidden; display: flex; }
+.menu button { flex: 1; padding: 14px; background: #333; color: white; border: none; font-size: 16px; }
+.menu button:hover { background: #111; }
+.section { display: none; padding: 20px; }
+.active { display: block; }
+h2 { margin-top: 0; }
+.card { background: white; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+label { display: block; margin-top: 10px; }
+input, select { width: 100%; padding: 8px; box-sizing: border-box; margin-top: 6px; }
+button.action { margin-top: 10px; padding: 10px; background: #4CAF50; color: white; border: none; border-radius: 4px; }
+.toggle { display: flex; align-items: center; margin-top: 8px; }
+.toggle input { margin-left: 10px; }
+.stats { font-size: 16px; line-height: 1.5; }
+.recipe { border: 1px solid #ddd; padding: 10px; border-radius: 5px; margin-bottom: 10px; background: #fafafa; }
+</style>
+</head>
+<body>
+<header>Smart Mixer Grinder</header>
+<div class="menu">
+  <button onclick="showSection('home')">Home</button>
+  <button onclick="showSection('myrecipes')">My Recipes</button>
+  <button onclick="showSection('publicrecipes')">Public Recipes</button>
+</div>
 
-  <div id="companyPage" style="display: none;">
-    <div class="card">
-      <h2>Company Recipes</h2>
-      <button class="btn" onclick="fetchCompanyRecipes()">🔄 Refresh</button>
-      <div id="companyRecipes" style="margin-top: 1rem;">Click Refresh to load recipes</div>
-    </div>
+<div id="home" class="section active">
+  <div class="card">
+    <h2>Motor Speed</h2>
+    <select id="motorSpeed" onchange="updateMotorSpeed()">
+      <option value="0">Off</option>
+      <option value="1">Level 1 (30%)</option>
+      <option value="2">Level 2 (60%)</option>
+      <option value="3">Level 3 (100%)</option>
+    </select>
+    <h2>UV Sterilization</h2>
+    <label class="toggle">Enable UV <input type="checkbox" id="uvToggle" onchange="updateUV()"></label>
   </div>
-
-  <div id="settingsPage" style="display: none;">
-    <div class="card">
-      <h2>Settings</h2>
-      <form onsubmit="saveSettings(event)">
-        <div class="form-group">
-          <label>API Base URL</label>
-          <input type="url" id="apiUrl" placeholder="https://api.airtable.com/v0/BASE_ID/TABLE_NAME">
-        </div>
-        <div class="form-group">
-          <label>API Key</label>
-          <input type="password" id="apiKey" placeholder="Your API key">
-        </div>
-        <div class="form-group">
-          <label>Allowed Domain</label>
-          <input type="text" id="allowedDomain" value="api.airtable.com">
-        </div>
-        <div class="form-group">
-          <label>Device PIN (optional)</label>
-          <input type="password" id="devicePin" placeholder="4-6 digits" pattern="[0-9]{4,6}">
-        </div>
-        <button type="submit" class="btn">💾 Save Settings</button>
-        <button type="button" onclick="testApi()" class="btn" style="background: #f39c12;">🧪 Test API</button>
-      </form>
-    </div>
-    
-    <div class="card">
-      <h2>Danger Zone</h2>
-      <p>Factory reset will erase all settings and recipes.</p>
-      <div class="form-group">
-        <label>Type "RESET" to confirm</label>
-        <input type="text" id="resetConfirm" placeholder="RESET">
-      </div>
-      <button onclick="factoryReset()" class="btn danger">🗑️ Factory Reset</button>
-    </div>
+  <div class="card stats">
+    <h2>Power Stats</h2>
+    Voltage: <span id="voltage">--</span> V<br>
+    Current: <span id="current">--</span> A<br>
+    Power: <span id="power">--</span> W
   </div>
 </div>
 
-<div class="toast" id="toast"></div>
+<div id="myrecipes" class="section">
+  <div class="card">
+    <h2>Create Recipe</h2>
+    <input type="text" id="recipeName" placeholder="Recipe Name">
+    <textarea id="ingredients" placeholder="Ingredients (name,weight,calories per line)"></textarea>
+    <input type="number" id="servingSize" placeholder="Serving Size">
+    <select id="recipeMotorSpeed">
+      <option value="1">Level 1</option>
+      <option value="2">Level 2</option>
+      <option value="3">Level 3</option>
+    </select>
+    <input type="number" id="recipeTime" placeholder="Run Time (seconds)">
+    <button class="action" onclick="saveRecipe()">Save Recipe</button>
+  </div>
+  <div id="recipeList"></div>
+</div>
+
+<div id="publicrecipes" class="section">
+  <div class="card">
+    <h2>Public Recipes</h2>
+    <button class="action" onclick="loadPublicRecipes()">Load from Internet</button>
+    <div id="publicList"></div>
+  </div>
+</div>
 
 <script>
-let currentPage = 'home';
-let devicePin = '';
-let updateInterval;
+var ws;
 
-function toggleNav() {
-  document.getElementById('navMenu').classList.toggle('active');
-}
-
-function showPage(page) {
-  document.getElementById('navMenu').classList.remove('active');
-  document.querySelectorAll('[id$="Page"]').forEach(p => p.style.display = 'none');
-  document.getElementById(page + 'Page').style.display = 'block';
-  currentPage = page;
-  
-  if (page === 'home') startStatusUpdates();
-  else if (page === 'recipes') loadLocalRecipes();
-  else if (page === 'settings') loadSettings();
-  else stopStatusUpdates();
-}
-
-function showToast(message, type = 'info') {
-  const toast = document.getElementById('toast');
-  toast.textContent = message;
-  toast.style.display = 'block';
-  toast.style.background = type === 'error' ? '#e74c3c' : '#2c3e50';
-  setTimeout(() => { toast.style.display = 'none'; }, 3000);
-}
-
-async function apiCall(endpoint, method = 'GET', body = null, requirePin = false) {
-  const headers = { 'Content-Type': 'application/json' };
-  if (requirePin && devicePin) headers['X-Device-PIN'] = devicePin;
-  
-  const response = await fetch('/api' + endpoint, {
-    method, headers, body: body ? JSON.stringify(body) : null
-  });
-  
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(error || 'API call failed');
-  }
-  
-  return response.json();
-}
-
-async function updateStatus() {
-  try {
-    const state = await apiCall('/state');
-    const status = document.getElementById('statusDisplay');
-    const progress = document.getElementById('progressContainer');
-    const stopBtn = document.getElementById('stopBtn');
-    
-    // Update button states
-    document.querySelectorAll('.speed-buttons .btn').forEach(btn => btn.classList.remove('active'));
-    if (state.activeSpeed === 0) {
-      document.getElementById('btnOff').classList.add('active');
-      status.textContent = 'All Off';
-      status.className = 'status idle';
-      progress.style.display = 'none';
-      stopBtn.style.display = 'none';
-    } else {
-      document.getElementById('btnSpeed' + state.activeSpeed).classList.add('active');
-      if (state.mode === 'running') {
-        status.textContent = `Running Speed ${state.activeSpeed} (${state.remainingSeconds}s remaining)`;
-        status.className = 'status running';
-        progress.style.display = 'block';
-        stopBtn.style.display = 'block';
-        
-        // Update progress bar (assuming we know total time somehow)
-        const progressPercent = Math.max(0, Math.min(100, ((300 - state.remainingSeconds) / 300) * 100));
-        document.getElementById('progressFill').style.width = progressPercent + '%';
-      } else {
-        status.textContent = `Speed ${state.activeSpeed} Active`;
-        status.className = 'status running';
-        progress.style.display = 'none';
-        stopBtn.style.display = 'none';
-      }
-    }
-  } catch (error) {
-    console.error('Status update failed:', error);
-  }
-}
-
-function startStatusUpdates() {
-  updateStatus();
-  updateInterval = setInterval(updateStatus, 1000);
-}
-
-function stopStatusUpdates() {
-  if (updateInterval) clearInterval(updateInterval);
-}
-
-async function setSpeed(speed) {
-  try {
-    await apiCall('/speed', 'POST', { speed }, true);
-    showToast('Speed updated');
-    updateStatus();
-  } catch (error) {
-    showToast('Error: ' + error.message, 'error');
-  }
-}
-
-async function stopRecipe() {
-  await setSpeed(0);
-}
-
-async function loadLocalRecipes() {
-  try {
-    const recipes = await apiCall('/recipes/local');
-    const container = document.getElementById('localRecipes');
-    
-    if (recipes.length === 0) {
-      container.innerHTML = '<p>No recipes saved yet. Add some recipes to get started!</p>';
-      return;
-    }
-    
-    container.innerHTML = recipes.map(recipe => `
-      <div class="recipe-card">
-        <div class="recipe-title">${escapeHtml(recipe.name)}</div>
-        <div>Speed: ${recipe.speed_level}, Timer: ${recipe.timer}s</div>
-        <div>Servings: ${recipe.serving_size}, Calories: ${calculateTotalCalories(recipe.ingredients)}</div>
-        <details style="margin-top: 0.5rem;">
-          <summary>Ingredients (${recipe.ingredients.length})</summary>
-          <ul style="margin: 0.5rem 0;">
-            ${recipe.ingredients.map(ing => 
-              `<li>${escapeHtml(ing.name)} - ${ing.weight}g (${ing.calories} cal)</li>`
-            ).join('')}
-          </ul>
-        </details>
-        <div class="recipe-actions">
-          <button class="btn btn-sm" onclick="runRecipe(${recipe.speed_level}, ${recipe.timer}, '${escapeHtml(recipe.name)}')">▶️ Run</button>
-          <button class="btn btn-sm danger" onclick="deleteRecipe('${recipe.id}')">🗑️ Delete</button>
-        </div>
-      </div>
-    `).join('');
-  } catch (error) {
-    document.getElementById('localRecipes').innerHTML = 'Error loading recipes: ' + error.message;
-  }
-}
-
-function calculateTotalCalories(ingredients) {
-  return ingredients.reduce((total, ing) => total + (ing.calories || 0), 0);
-}
-
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-}
-
-async function runRecipe(speedLevel, timer, name = '') {
-  try {
-    await apiCall('/recipes/run', 'POST', { speed_level: speedLevel, timer: timer }, true);
-    showToast(`Started recipe: ${name}`);
-    if (currentPage === 'home') updateStatus();
-  } catch (error) {
-    showToast('Error: ' + error.message, 'error');
-  }
-}
-
-async function deleteRecipe(id) {
-  if (!confirm('Delete this recipe?')) return;
-  try {
-    await apiCall('/recipes/local/delete', 'POST', { id }, true);
-    showToast('Recipe deleted');
-    loadLocalRecipes();
-  } catch (error) {
-    showToast('Error: ' + error.message, 'error');
-  }
-}
-
-function showAddRecipeForm() {
-  document.getElementById('addRecipeForm').style.display = 'block';
-}
-
-function cancelAddRecipe() {
-  document.getElementById('addRecipeForm').style.display = 'none';
-  document.getElementById('addRecipeForm').querySelector('form').reset();
-  resetIngredientsForm();
-}
-
-function addIngredient() {
-  const list = document.getElementById('ingredientsList');
-  const row = document.createElement('div');
-  row.className = 'ingredient-row';
-  row.innerHTML = `
-    <input type="text" placeholder="Ingredient name" class="ing-name">
-    <input type="number" placeholder="Weight (g)" class="ing-weight" style="max-width: 100px;">
-    <input type="number" placeholder="Calories" class="ing-calories" style="max-width: 100px;">
-    <button type="button" onclick="removeIngredient(this)" class="btn btn-sm danger">×</button>
-  `;
-  list.appendChild(row);
-}
-
-function removeIngredient(btn) {
-  btn.parentElement.remove();
-}
-
-function resetIngredientsForm() {
-  const list = document.getElementById('ingredientsList');
-  list.innerHTML = `
-    <div class="ingredient-row">
-      <input type="text" placeholder="Ingredient name" class="ing-name">
-      <input type="number" placeholder="Weight (g)" class="ing-weight" style="max-width: 100px;">
-      <input type="number" placeholder="Calories" class="ing-calories" style="max-width: 100px;">
-      <button type="button" onclick="removeIngredient(this)" class="btn btn-sm danger">×</button>
-    </div>
-  `;
-}
-
-async function saveRecipe(event) {
-  event.preventDefault();
-  
-  const name = document.getElementById('recipeName').value.trim();
-  if (!name) {
-    showToast('Recipe name is required', 'error');
-    return;
-  }
-  
-  const ingredients = [];
-  document.querySelectorAll('.ingredient-row').forEach(row => {
-    const nameInput = row.querySelector('.ing-name').value.trim();
-    const weight = parseInt(row.querySelector('.ing-weight').value) || 0;
-    const calories = parseInt(row.querySelector('.ing-calories').value) || 0;
-    if (nameInput) {
-      ingredients.push({ name: nameInput, weight, calories });
-    }
-  });
-  
-  const recipe = {
-    id: 'local_' + Date.now(),
-    name,
-    ingredients,
-    serving_size: parseInt(document.getElementById('servingSize').value) || 1,
-    speed_level: parseInt(document.getElementById('speedLevel').value),
-    timer: parseInt(document.getElementById('recipeTimer').value) || 30
+function initWebSocket() {
+  ws = new WebSocket('ws://' + window.location.host + '/ws');
+  ws.onmessage = function(evt) {
+    let data = JSON.parse(evt.data);
+    document.getElementById("voltage").innerText = data.voltage.toFixed(2);
+    document.getElementById("current").innerText = data.current.toFixed(2);
+    document.getElementById("power").innerText = data.power.toFixed(2);
+    document.getElementById("motorSpeed").value = data.motorSpeed;
+    document.getElementById("uvToggle").checked = data.uvOn;
   };
-  
-  try {
-    await apiCall('/recipes/local/add', 'POST', recipe, true);
-    showToast('Recipe saved!');
-    cancelAddRecipe();
-    loadLocalRecipes();
-  } catch (error) {
-    showToast('Error: ' + error.message, 'error');
-  }
 }
 
-async function fetchCompanyRecipes() {
-  try {
-    const btn = event.target;
-    btn.innerHTML = '<span class="loading"></span> Loading...';
-    btn.disabled = true;
-    
-    const recipes = await apiCall('/company/list');
-    const container = document.getElementById('companyRecipes');
-    
-    if (recipes.length === 0) {
-      container.innerHTML = '<p>No company recipes found. Check your API settings.</p>';
-    } else {
-      container.innerHTML = recipes.map(recipe => `
-        <div class="recipe-card">
-          <div class="recipe-title">${escapeHtml(recipe.name)}</div>
-          <div>Speed: ${recipe.speed_level}, Timer: ${recipe.timer}s</div>
-          <div>Servings: ${recipe.serving_size}, Calories: ${calculateTotalCalories(recipe.ingredients)}</div>
-          <details style="margin-top: 0.5rem;">
-            <summary>Ingredients (${recipe.ingredients.length})</summary>
-            <ul style="margin: 0.5rem 0;">
-              ${recipe.ingredients.map(ing => 
-                `<li>${escapeHtml(ing.name)} - ${ing.weight}g (${ing.calories} cal)</li>`
-              ).join('')}
-            </ul>
-          </details>
-          <div class="recipe-actions">
-            <button class="btn btn-sm" onclick="runRecipe(${recipe.speed_level}, ${recipe.timer}, '${escapeHtml(recipe.name)}')">▶️ Run Now</button>
-            <button class="btn btn-sm" onclick="copyToLocal('${recipe.id}')">📋 Add to My Recipes</button>
-          </div>
-        </div>
-      `).join('');
-    }
-  } catch (error) {
-    document.getElementById('companyRecipes').innerHTML = 'Error loading recipes: ' + error.message;
-  } finally {
-    const btn = document.querySelector('#companyPage button');
-    btn.innerHTML = '🔄 Refresh';
-    btn.disabled = false;
-  }
+function showSection(id) {
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
 }
 
-async function copyToLocal(companyRecipeId) {
-  try {
-    const companyRecipes = await apiCall('/company/list');
-    const recipe = companyRecipes.find(r => r.id === companyRecipeId);
-    if (!recipe) throw new Error('Recipe not found');
-    
-    const localRecipe = {
-      ...recipe,
-      id: 'local_' + Date.now()
-    };
-    
-    await apiCall('/recipes/local/add', 'POST', localRecipe, true);
-    showToast('Recipe copied to My Recipes!');
-  } catch (error) {
-    showToast('Error: ' + error.message, 'error');
-  }
+function updateMotorSpeed() {
+  let val = parseInt(document.getElementById('motorSpeed').value);
+  ws.send(JSON.stringify({motorSpeed: val}));
 }
 
-async function loadSettings() {
-  // Settings are server-side only for security, just provide form
-  const pin = localStorage.getItem('devicePin') || '';
-  document.getElementById('devicePin').value = pin;
-  devicePin = pin;
+function updateUV() {
+  let on = document.getElementById('uvToggle').checked;
+  ws.send(JSON.stringify({uvOn: on}));
 }
 
-async function saveSettings(event) {
-  event.preventDefault();
-  
-  const settings = {
-    apiUrl: document.getElementById('apiUrl').value,
-    apiKey: document.getElementById('apiKey').value,
-    allowedDomain: document.getElementById('allowedDomain').value,
-    devicePin: document.getElementById('devicePin').value
-  };
-  
-  try {
-    await apiCall('/settings/save', 'POST', settings, devicePin ? true : false);
-    
-    // Store PIN locally for subsequent requests
-    if (settings.devicePin) {
-      localStorage.setItem('devicePin', settings.devicePin);
-      devicePin = settings.devicePin;
-    } else {
-      localStorage.removeItem('devicePin');
-      devicePin = '';
-    }
-    
-    showToast('Settings saved!');
-  } catch (error) {
-    showToast('Error: ' + error.message, 'error');
-  }
+function saveRecipe() {
+  let name = document.getElementById('recipeName').value;
+  let ing = document.getElementById('ingredients').value.trim().split("\\n").map(line => {
+    let p = line.split(',');
+    return { name: p[0], weight: p[1], calories: p[2] };
+  });
+  let serving = parseInt(document.getElementById('servingSize').value);
+  let speed = parseInt(document.getElementById('recipeMotorSpeed').value);
+  let time = parseInt(document.getElementById('recipeTime').value);
+
+  fetch('/api/recipes').then(r => r.json()).then(recipes => {
+    recipes.push({ name, ingredients: ing, serving, speed, time });
+    return fetch('/api/recipes', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(recipes) });
+  }).then(() => loadRecipes());
 }
 
-async function testApi() {
-  try {
-    const btn = event.target;
-    btn.innerHTML = '<span class="loading"></span> Testing...';
-    btn.disabled = true;
-    
-    const recipes = await apiCall('/company/list');
-    showToast(`API test successful! Found ${recipes.length} recipes.`);
-  } catch (error) {
-    showToast('API test failed: ' + error.message, 'error');
-  } finally {
-    const btn = document.querySelector('button[onclick="testApi()"]');
-    btn.innerHTML = '🧪 Test API';
-    btn.disabled = false;
-  }
+function loadRecipes() {
+  fetch('/api/recipes').then(r => r.json()).then(data => {
+    let html = '';
+    data.forEach((r,i) => {
+      let totalCal = r.ingredients.reduce((a,b)=>a+parseFloat(b.calories), 0);
+      html += `<div class="recipe"><b>${r.name}</b> - ${totalCal} Cal<br><button onclick="deleteRecipe(${i})">Delete</button></div>`;
+    });
+    document.getElementById('recipeList').innerHTML = html;
+  });
 }
 
-async function factoryReset() {
-  const confirm = document.getElementById('resetConfirm').value;
-  if (confirm !== 'RESET') {
-    showToast('Type "RESET" to confirm', 'error');
-    return;
-  }
-  
-  try {
-    await apiCall('/settings/factory_reset', 'POST', {}, true);
-    showToast('Factory reset initiated. Device will restart...');
-    setTimeout(() => location.reload(), 3000);
-  } catch (error) {
-    showToast('Error: ' + error.message, 'error');
-  }
+function deleteRecipe(index) {
+  fetch('/api/recipes').then(r => r.json()).then(data => {
+    data.splice(index,1);
+    return fetch('/api/recipes', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
+  }).then(() => loadRecipes());
 }
 
-// Initialize
+function loadPublicRecipes() {
+  fetch('/api/public').then(r => r.json()).then(data => {
+    let html = '';
+    data.forEach(r => {
+      let totalCal = r.ingredients.reduce((a,b)=>a+parseFloat(b.calories), 0);
+      html += `<div class="recipe"><b>${r.name}</b> - ${totalCal} Cal<br><button onclick='importRecipe(${JSON.stringify(r)})'>Import</button></div>`;
+    });
+    document.getElementById('publicList').innerHTML = html;
+  });
+}
+
+function importRecipe(recipe) {
+  fetch('/api/recipes').then(r => r.json()).then(recipes => {
+    recipes.push(recipe);
+    return fetch('/api/recipes', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(recipes) });
+  }).then(() => alert("Imported!"));
+}
+
 window.onload = function() {
-  showPage('home');
-  // Load stored PIN
-  devicePin = localStorage.getItem('devicePin') || '';
-};
-
-// Handle clicks outside nav menu
-document.addEventListener('click', function(event) {
-  const nav = document.getElementById('navMenu');
-  const hamburger = document.querySelector('.hamburger');
-  if (!nav.contains(event.target) && !hamburger.contains(event.target)) {
-    nav.classList.remove('active');
-  }
-});
+  initWebSocket();
+  loadRecipes();
+}
 </script>
-</body></html>
+</body>
+</html>
 )rawliteral";
 
-// Utility functions
-void setupGPIO() {
-  pinMode(PIN_SPEED1, OUTPUT);
-  pinMode(PIN_SPEED2, OUTPUT);
-  pinMode(PIN_SPEED3, OUTPUT);
-  
-  // Ensure all pins start LOW (off)
-  digitalWrite(PIN_SPEED1, LOW);
-  digitalWrite(PIN_SPEED2, LOW);
-  digitalWrite(PIN_SPEED3, LOW);
+
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <ArduinoJson.h>
+#include "EmonLib.h"
+#include <Preferences.h>
+
+// Motor & UV pin definitions
+#define MOTOR_PIN 25
+#define UV_PIN 26
+
+// Motor PWM configuration
+#define PWM_CHANNEL 0
+#define PWM_FREQ 5000
+#define PWM_RES 8
+
+// Voltage and current sensor pins
+#define V1 34
+#define I1 35
+#define CV1 1000
+#define CI1 1000
+
+// Include Preferences for storing WiFi info
+Preferences preferences;
+
+// Web server and WebSocket server on port 80
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// Energy monitoring object
+EnergyMonitor emon1;
+
+// Stores if ESP32 connected as station
+bool isSTA = false;
+
+String savedSSID;
+String savedPass;
+
+// Runtime motor speed state (0-3)
+uint8_t motorSpeedLevel = 0;  // 0=off,1=30%,2=60%,3=100%
+
+// UV LED state
+bool uvOn = false;
+
+// In-memory recipe storage (JSON string)
+String recipesJSON = "[]";
+
+// --- Utility functions ---
+
+// Set PWM duty from motor speed level
+void setMotorSpeed(uint8_t level) {
+  uint8_t duty = 0;
+  if (level == 1) duty = 76;  // 30% of 255
+  else if (level == 2) duty = 153; // 60%
+  else if (level == 3) duty = 255;  // 100%
+  motorSpeedLevel = level;
+  ledcWrite(PWM_CHANNEL, duty);
 }
 
-void setSpeedPins(int speed) {
-  digitalWrite(PIN_SPEED1, speed == 1 ? HIGH : LOW);
-  digitalWrite(PIN_SPEED2, speed == 2 ? HIGH : LOW);
-  digitalWrite(PIN_SPEED3, speed == 3 ? HIGH : LOW);
-  
-  deviceState.activeSpeed = speed;
-  if (speed == 0) {
-    deviceState.running = false;
-    deviceState.runUntil = 0;
-    deviceState.currentRecipeName = "";
-  }
+// Set UV LED GPIO
+void setUV(bool on) {
+  uvOn = on;
+  digitalWrite(UV_PIN, uvOn ? HIGH : LOW);
 }
 
-void stopRecipeTimer() {
-  recipeTimer.detach();
-  setSpeedPins(0);
-  Serial.println("Recipe timer completed - all pins OFF");
+// Read power data, return JSON string
+String getPowerDataJSON() {
+  emon1.calcVI(20, 2000);
+  float voltage = emon1.Vrms;
+  float current = emon1.Irms;
+  float power = voltage * current;
+  StaticJsonDocument<200> doc;
+  doc["voltage"] = voltage;
+  doc["current"] = current;
+  doc["power"] = power;
+  doc["motorSpeed"] = motorSpeedLevel;
+  doc["uvOn"] = uvOn;
+  String out;
+  serializeJson(doc, out);
+  return out;
 }
 
-bool validateDomain(String url, String allowedDomain) {
-  if (url.startsWith("https://")) {
-    int hostStart = 8; // after "https://"
-    int hostEnd = url.indexOf('/', hostStart);
-    if (hostEnd == -1) hostEnd = url.length();
-    String host = url.substring(hostStart, hostEnd);
-    return host == allowedDomain;
+// Save WiFi credentials in preferences
+void saveWiFiCredentials(String ssid, String pass) {
+  preferences.begin("wifi", false);
+  preferences.putString("ssid", ssid);
+  preferences.putString("pass", pass);
+  preferences.end();
+}
+
+// Load WiFi credentials from preferences
+bool loadWiFiCredentials() {
+  preferences.begin("wifi", true);
+  savedSSID = preferences.getString("ssid", "");
+  savedPass = preferences.getString("pass", "");
+  preferences.end();
+  return savedSSID.length() > 0;
+}
+
+// Connect to WiFi as station
+bool connectToWiFi() {
+  if (loadWiFiCredentials()) {
+    WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+    Serial.print("Connecting to WiFi");
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
+      Serial.print(".");
+      delay(500);
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("Connected to WiFi!");
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      return true;
+    }
   }
   return false;
 }
 
-bool requirePIN(AsyncWebServerRequest *request) {
-  String devicePIN = prefs.getString("device_pin", "");
-  if (devicePIN.length() == 0) return true; // No PIN required
+// Start Access Point mode with captive portal
+void startAPMode() {
+  WiFi.softAP("MixerGrinder_Setup", "12345678");
+  Serial.println("Started AP Mode: MixerGrinder_Setup");
   
-  if (request->hasHeader("X-Device-PIN")) {
-    return request->header("X-Device-PIN") == devicePIN;
-  }
-  return false;
-}
-
-String loadLocalRecipes() {
-  if (!SPIFFS.exists(RECIPES_FILE)) {
-    // Create empty recipes file
-    File file = SPIFFS.open(RECIPES_FILE, "w");
-    if (file) {
-      file.println("[]");
-      file.close();
-    }
-    return "[]";
-  }
-  
-  File file = SPIFFS.open(RECIPES_FILE, "r");
-  if (!file) return "[]";
-  
-  String content = file.readString();
-  file.close();
-  return content;
-}
-
-bool saveLocalRecipes(String jsonData) {
-  // Atomic write: write to temp file first
-  File file = SPIFFS.open(RECIPES_TEMP, "w");
-  if (!file) return false;
-  
-  file.print(jsonData);
-  file.close();
-  
-  // Move temp to actual file
-  SPIFFS.remove(RECIPES_FILE);
-  SPIFFS.rename(RECIPES_TEMP, RECIPES_FILE);
-  return true;
-}
-
-String fetchCompanyRecipes() {
-  // Check rate limiting
-  unsigned long now = millis();
-  if (now - lastApiCall < API_RATE_LIMIT_MS) {
-    Serial.println("API rate limited");
-    if (apiCache.isValid && (now - apiCache.lastFetch < API_CACHE_DURATION_MS)) {
-      return apiCache.lastResponse;
-    }
-    return "[]"; // Return empty if rate limited and cache expired
-  }
-  
-  String apiUrl = prefs.getString("api_url", "");
-  String apiKey = prefs.getString("api_key", "");
-  String allowedDomain = prefs.getString("allowed_domain", "api.airtable.com");
-  
-  if (apiUrl.length() == 0 || apiKey.length() == 0) {
-    Serial.println("API URL or key not configured");
-    return "[]";
-  }
-  
-  if (!validateDomain(apiUrl, allowedDomain)) {
-    Serial.println("Domain validation failed");
-    return "[]";
-  }
-  
-  lastApiCall = now;
-  
-  HTTPClient http;
-  WiFiClientSecure *client = nullptr;
-  
-  if (apiUrl.startsWith("https://")) {
-    client = new WiFiClientSecure();
-    
-    #if USE_INSECURE_TLS
-      client->setInsecure(); // QUICKSTART MODE - NOT SECURE!
-      Serial.println("WARNING: Using insecure TLS mode");
-    #else
-      client->setCACert(airtable_root_ca); // PRODUCTION MODE
-    #endif
-    
-    http.begin(*client, apiUrl);
-  } else {
-    http.begin(apiUrl);
-  }
-  
-  http.addHeader("Authorization", "Bearer " + apiKey);
-  http.addHeader("Content-Type", "application/json");
-  
-  int httpCode = http.GET();
-  String response = "";
-  
-  if (httpCode == 200) {
-    String rawResponse = http.getString();
-    Serial.println("Raw API response length: " + String(rawResponse.length()));
-    
-    // Parse and normalize Airtable response
-    DynamicJsonDocument doc(8192); // Adjust size based on expected data
-    DeserializationError error = deserializeJson(doc, rawResponse);
-    
-    if (error) {
-      Serial.println("JSON parse error: " + String(error.c_str()));
-      response = "[]";
-    } else {
-      // Normalize to internal format
-      DynamicJsonDocument normalizedDoc(8192);
-      JsonArray normalizedArray = normalizedDoc.to<JsonArray>();
-      
-      JsonArray records = doc["records"];
-      for (JsonObject record : records) {
-        JsonObject fields = record["fields"];
-        
-        // Validate required fields and data types
-        if (!fields.containsKey(AIRTABLE_FIELD_NAME) || 
-            !fields.containsKey(AIRTABLE_FIELD_SPEED) ||
-            !fields.containsKey(AIRTABLE_FIELD_TIMER)) {
-          continue; // Skip incomplete records
-        }
-        
-        int speedLevel = fields[AIRTABLE_FIELD_SPEED].as<int>();
-        if (speedLevel < 1 || speedLevel > 3) continue; // Skip invalid speeds
-        
-        JsonObject normalized = normalizedArray.createNestedObject();
-        normalized["id"] = record["id"].as<String>();
-        normalized["name"] = fields[AIRTABLE_FIELD_NAME].as<String>();
-        normalized["speed_level"] = speedLevel;
-        normalized["timer"] = fields[AIRTABLE_FIELD_TIMER].as<int>();
-        normalized["serving_size"] = fields[AIRTABLE_FIELD_SERVING] | 1;
-        
-        // Parse ingredients JSON string
-        JsonArray ingredients = normalized.createNestedArray("ingredients");
-        if (fields.containsKey(AIRTABLE_FIELD_INGREDIENTS)) {
-          String ingredientsStr = fields[AIRTABLE_FIELD_INGREDIENTS].as<String>();
-          DynamicJsonDocument ingredientsDoc(1024);
-          if (deserializeJson(ingredientsDoc, ingredientsStr) == DeserializationError::Ok) {
-            for (JsonObject ing : ingredientsDoc.as<JsonArray>()) {
-              JsonObject newIng = ingredients.createNestedObject();
-              newIng["name"] = ing["name"].as<String>();
-              newIng["weight"] = ing["weight"] | 0;
-              newIng["calories"] = ing["calories"] | 0;
-            }
-          }
-        }
-      }
-      
-      serializeJson(normalizedDoc, response);
-      
-      // Cache the result
-      apiCache.lastResponse = response;
-      apiCache.lastFetch = now;
-      apiCache.isValid = true;
-    }
-  } else {
-    Serial.println("HTTP error: " + String(httpCode));
-    response = "[]";
-  }
-  
-  http.end();
-  if (client) delete client;
-  
-  return response;
-}
-
-void setupWebServer() {
-  // Serve main page
+  // Serve WiFi setup page on root "/"
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/html", html_index);
+    request->send_P(200, "text/html", wifiSetupHTML);
   });
-  
-  // API Endpoints
-  
-  // GET /api/state
-  server.on("/api/state", HTTP_GET, [](AsyncWebServerRequest *request) {
-    DynamicJsonDocument doc(512);
-    doc["mode"] = deviceState.running ? "running" : "idle";
-    doc["activeSpeed"] = deviceState.activeSpeed;
-    
-    if (deviceState.running && deviceState.runUntil > millis()) {
-      doc["remainingSeconds"] = (deviceState.runUntil - millis()) / 1000;
+
+  // Handle WiFi credentials submission
+  server.on("/savewifi", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if(request->hasParam("ssid", true) && request->hasParam("pass", true)) {
+      String newSSID = request->getParam("ssid", true)->value();
+      String newPass = request->getParam("pass", true)->value();
+      saveWiFiCredentials(newSSID, newPass);
+      request->send(200, "text/plain", "Saved WiFi settings. Rebooting...");
+      delay(1000);
+      ESP.restart();
     } else {
-      doc["remainingSeconds"] = 0;
+      request->send(400, "text/plain", "Missing SSID or Password");
     }
-    
-    String response;
-    serializeJson(doc, response);
-    request->send(200, "application/json", response);
-  });
-  
-  // POST /api/speed
-  server.on("/api/speed", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!requirePIN(request)) {
-      request->send(401, "text/plain", "PIN required");
-      return;
-    }
-  }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-    DynamicJsonDocument doc(256);
-    DeserializationError error = deserializeJson(doc, (char*)data);
-    
-    if (error) {
-      request->send(400, "text/plain", "Invalid JSON");
-      return;
-    }
-    
-    int speed = doc["speed"] | -1;
-    if (speed < 0 || speed > 3) {
-      request->send(400, "text/plain", "Speed must be 0-3");
-      return;
-    }
-    
-    setSpeedPins(speed);
-    request->send(200, "application/json", "{\"status\":\"ok\"}");
-  });
-  
-  // GET /api/recipes/local
-  server.on("/api/recipes/local", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String recipes = loadLocalRecipes();
-    request->send(200, "application/json", recipes);
-  });
-  
-  // POST /api/recipes/local/add
-  server.on("/api/recipes/local/add", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!requirePIN(request)) {
-      request->send(401, "text/plain", "PIN required");
-      return;
-    }
-  }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-    DynamicJsonDocument newRecipe(2048);
-    DeserializationError error = deserializeJson(newRecipe, (char*)data);
-    
-    if (error) {
-      request->send(400, "text/plain", "Invalid JSON");
-      return;
-    }
-    
-    // Validate required fields
-    if (!newRecipe.containsKey("name") || !newRecipe.containsKey("speed_level")) {
-      request->send(400, "text/plain", "Missing required fields");
-      return;
-    }
-    
-    int speedLevel = newRecipe["speed_level"];
-    if (speedLevel < 1 || speedLevel > 3) {
-      request->send(400, "text/plain", "Speed level must be 1-3");
-      return;
-    }
-    
-    // Load existing recipes
-    String existingJson = loadLocalRecipes();
-    DynamicJsonDocument recipes(8192);
-    deserializeJson(recipes, existingJson);
-    
-   // Add new recipe
-JsonArray array = recipes.as<JsonArray>();
-JsonObject recipe = array.createNestedObject();
-recipe.set(newRecipe.as<JsonObject>());
-    
-    // Save back
-    String updatedJson;
-    serializeJson(recipes, updatedJson);
-    
-    if (saveLocalRecipes(updatedJson)) {
-      request->send(200, "application/json", "{\"status\":\"ok\"}");
-    } else {
-      request->send(500, "text/plain", "Failed to save recipe");
-    }
-  });
-  
-  // POST /api/recipes/local/delete
-  server.on("/api/recipes/local/delete", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!requirePIN(request)) {
-      request->send(401, "text/plain", "PIN required");
-      return;
-    }
-  }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-    DynamicJsonDocument deleteReq(256);
-    DeserializationError error = deserializeJson(deleteReq, (char*)data);
-    
-    if (error || !deleteReq.containsKey("id")) {
-      request->send(400, "text/plain", "Invalid JSON or missing ID");
-      return;
-    }
-    
-    String targetId = deleteReq["id"].as<String>();
-    
-    // Load existing recipes
-    String existingJson = loadLocalRecipes();
-    DynamicJsonDocument recipes(8192);
-    deserializeJson(recipes, existingJson);
-    
-    // Remove recipe with matching ID
-    JsonArray array = recipes.as<JsonArray>();
-    for (int i = array.size() - 1; i >= 0; i--) {
-      if (array[i]["id"].as<String>() == targetId) {
-        array.remove(i);
-        break;
-      }
-    }
-    
-    // Save back
-    String updatedJson;
-    serializeJson(recipes, updatedJson);
-    
-    if (saveLocalRecipes(updatedJson)) {
-      request->send(200, "application/json", "{\"status\":\"ok\"}");
-    } else {
-      request->send(500, "text/plain", "Failed to save recipes");
-    }
-  });
-  
-  // POST /api/recipes/run
-  server.on("/api/recipes/run", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!requirePIN(request)) {
-      request->send(401, "text/plain", "PIN required");
-      return;
-    }
-  }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-    DynamicJsonDocument runReq(256);
-    DeserializationError error = deserializeJson(runReq, (char*)data);
-    
-    if (error) {
-      request->send(400, "text/plain", "Invalid JSON");
-      return;
-    }
-    
-    int speedLevel = runReq["speed_level"] | 0;
-    int timer = runReq["timer"] | 30;
-    
-    if (speedLevel < 1 || speedLevel > 3) {
-      request->send(400, "text/plain", "Speed level must be 1-3");
-      return;
-    }
-    
-    if (timer < 1 || timer > MAX_RECIPE_TIMER) {
-      request->send(400, "text/plain", "Timer must be 1-" + String(MAX_RECIPE_TIMER) + " seconds");
-      return;
-    }
-    
-    // Cancel any existing timer
-    recipeTimer.detach();
-    
-    // Set speed pins
-    setSpeedPins(speedLevel);
-    
-    // Start timer
-    deviceState.running = true;
-    deviceState.runUntil = millis() + (timer * 1000);
-    deviceState.currentRecipeName = runReq["name"] | "";
-    
-    recipeTimer.once(timer, stopRecipeTimer);
-    
-    Serial.println("Recipe started: Speed " + String(speedLevel) + " for " + String(timer) + "s");
-    request->send(200, "application/json", "{\"status\":\"started\"}");
-  });
-  
-  // GET /api/company/list
-  server.on("/api/company/list", HTTP_GET, [](AsyncWebServerRequest *request) {
-    String recipes = fetchCompanyRecipes();
-    request->send(200, "application/json", recipes);
-  });
-  
-  // POST /api/settings/save
-  server.on("/api/settings/save", HTTP_POST, [](AsyncWebServerRequest *request) {
-    // PIN validation is optional for settings save (first-time setup)
-    String currentPin = prefs.getString("device_pin", "");
-    if (currentPin.length() > 0 && !requirePIN(request)) {
-      request->send(401, "text/plain", "PIN required");
-      return;
-    }
-  }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-    DynamicJsonDocument settings(1024);
-    DeserializationError error = deserializeJson(settings, (char*)data);
-    
-    if (error) {
-      request->send(400, "text/plain", "Invalid JSON");
-      return;
-    }
-    
-    // Save settings to NVS
-    if (settings.containsKey("apiUrl")) {
-      prefs.putString("api_url", settings["apiUrl"].as<String>());
-    }
-    if (settings.containsKey("apiKey")) {
-      prefs.putString("api_key", settings["apiKey"].as<String>());
-    }
-    if (settings.containsKey("allowedDomain")) {
-      prefs.putString("allowed_domain", settings["allowedDomain"].as<String>());
-    }
-    if (settings.containsKey("devicePin")) {
-      String pin = settings["devicePin"].as<String>();
-      if (pin.length() >= 4 && pin.length() <= 6) {
-        prefs.putString("device_pin", pin);
-      }
-    }
-    
-    // Clear API cache
-    apiCache.isValid = false;
-    
-    request->send(200, "application/json", "{\"status\":\"saved\"}");
-  });
-  
-  // POST /api/settings/factory_reset
-  server.on("/api/settings/factory_reset", HTTP_POST, [](AsyncWebServerRequest *request) {
-    if (!requirePIN(request)) {
-      request->send(401, "text/plain", "PIN required");
-      return;
-    }
-    
-    Serial.println("Factory reset initiated");
-    
-    // Clear NVS preferences
-    prefs.clear();
-    
-    // Clear WiFi credentials
-    WiFi.disconnect(true);
-    
-    // Remove local recipes
-    if (SPIFFS.exists(RECIPES_FILE)) {
-      SPIFFS.remove(RECIPES_FILE);
-    }
-    if (SPIFFS.exists(RECIPES_TEMP)) {
-      SPIFFS.remove(RECIPES_TEMP);
-    }
-    
-    request->send(200, "application/json", "{\"status\":\"reset_initiated\"}");
-    
-    delay(1000);
-    ESP.restart();
-  }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-    // Empty body handler required for POST
-  });
-  
-  // Handle 404
-  server.onNotFound([](AsyncWebServerRequest *request) {
-    request->send(404, "text/plain", "Not Found");
   });
   
   server.begin();
-  Serial.println("Web server started");
+}
+
+// Handle embedded web pages & APIs in Station mode
+void setupAPIRoutes() {
+  // Serve main UI page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", indexHTML);
+  });
+
+  // WebSocket event handler
+  ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+    if (type == WS_EVT_CONNECT) {
+      Serial.println("Client connected to WebSocket");
+    } else if (type == WS_EVT_DISCONNECT) {
+      Serial.println("Client disconnected from WebSocket");
+    } else if (type == WS_EVT_DATA) {
+      String msg = String((char*)data).substring(0, len);
+      StaticJsonDocument<256> doc;
+      DeserializationError error = deserializeJson(doc, msg);
+      if(!error) {
+        if (doc.containsKey("motorSpeed")) {
+          setMotorSpeed(doc["motorSpeed"]);
+        }
+        if (doc.containsKey("uvOn")) {
+          setUV(doc["uvOn"]);
+        }
+      }
+    }
+  });
+  server.addHandler(&ws);
+
+  // API: Return power data
+  server.on("/api/power", HTTP_GET, [](AsyncWebServerRequest *req){
+    req->send(200, "application/json", getPowerDataJSON());
+  });
+
+  // API: Get all saved recipes
+  server.on("/api/recipes", HTTP_GET, [](AsyncWebServerRequest *req){
+    req->send(200, "application/json", recipesJSON);
+  });
+
+  // API: Save recipes (overwrite all)
+  server.on("/api/recipes", HTTP_POST, [](AsyncWebServerRequest *req){
+    if(req->hasParam("plain", true)) {
+      String body = req->getParam("plain", true)->value();
+      StaticJsonDocument<1024> doc;
+      if(deserializeJson(doc, body) == DeserializationError::Ok) {
+        recipesJSON = body;
+        req->send(200, "text/plain", "Recipes saved");
+      } else {
+        req->send(400, "text/plain", "Invalid JSON");
+      }
+    } else {
+      req->send(400, "text/plain", "Missing JSON body");
+    }
+  });
+
+  // API: Fetch Public Recipes from mock URL (example, not implemented here)
+  server.on("/api/public", HTTP_GET, [](AsyncWebServerRequest *req){
+    // Just respond with empty array for now, UI will fetch real API online
+    req->send(200, "application/json", "[]");
+  });
+
+  server.begin();
+}
+
+// Update real-time stats every few seconds via WebSocket broadcast
+void notifyClientsPower() {
+  if (ws.count() > 0) {
+    ws.textAll(getPowerDataJSON());
+  }
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== ESP32 Recipe Controller Starting ===");
+  delay(1000);
+
+  // Motor and UV GPIO setup
+  pinMode(UV_PIN, OUTPUT);
+  digitalWrite(UV_PIN, LOW);
   
-  // Initialize GPIO
-  setupGPIO();
-  Serial.println("GPIO pins initialized");
-  
-  // Initialize SPIFFS
-  if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS initialization failed!");
-    return;
-  }
-  Serial.println("SPIFFS initialized");
-  
-  // Initialize preferences
-  prefs.begin("recipe_ctrl", false);
-  
-  // WiFi Setup with WiFiManager
-  WiFiManager wifiManager;
-  
-  // Uncomment to reset WiFi settings for testing
-  // wifiManager.resetSettings();
-  
-  wifiManager.setAPCallback([](WiFiManager* myWiFiManager) {
-    Serial.println("Entered config mode");
-    Serial.println("SSID: " + String(AP_SSID));
-    Serial.println("Password: " + String(AP_PASSWORD));
-    Serial.println("IP: " + WiFi.softAPIP().toString());
-  });
-  
-  wifiManager.setSaveConfigCallback([]() {
-    Serial.println("WiFi config saved, will restart");
-  });
-  
-  // Try to connect, or start AP mode
-  if (!wifiManager.autoConnect(AP_SSID, AP_PASSWORD)) {
-    Serial.println("Failed to connect and hit timeout");
-    delay(3000);
-    ESP.restart();
-    delay(5000);
-  }
-  
-  // Connected to WiFi
-  Serial.println("WiFi connected successfully!");
-  Serial.println("IP address: " + WiFi.localIP().toString());
-  
-  // Start mDNS
-  if (MDNS.begin(DEVICE_HOSTNAME)) {
-    Serial.println("mDNS responder started: http://" + String(DEVICE_HOSTNAME) + ".local");
-    MDNS.addService("http", "tcp", 80);
+  ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RES);
+  ledcAttachPin(MOTOR_PIN, PWM_CHANNEL);
+  setMotorSpeed(0);  // motor off initially
+
+  // Sensor setup
+  analogSetPinAttenuation(V1, ADC_11db);
+  analogSetPinAttenuation(I1, ADC_11db);
+  emon1.voltage(V1, CV1, 1.732);
+  emon1.current(I1, CI1);
+
+  // Initialize Preferences
+  preferences.begin("wifi", false);
+
+  if (connectToWiFi()) {
+    isSTA = true;
+    Serial.println("Running in Station mode");
+    setupAPIRoutes();
   } else {
-    Serial.println("Error starting mDNS");
+    isSTA = false;
+    Serial.println("Running in AP mode");
+    startAPMode();
   }
-  
-  // Setup web server
-  setupWebServer();
-  
-  Serial.println("=== Setup Complete ===");
-  Serial.println("Visit: http://" + WiFi.localIP().toString());
-  Serial.println("   or: http://" + String(DEVICE_HOSTNAME) + ".local");
 }
 
 void loop() {
-  // Check if recipe timer has expired (backup to Ticker)
-  if (deviceState.running && millis() >= deviceState.runUntil) {
-    stopRecipeTimer();
+  if (isSTA) {
+    static unsigned long lastNotify = 0;
+    if (millis() - lastNotify > 2000) {
+      notifyClientsPower();
+      lastNotify = millis();
+    }
   }
-  
-  // Small delay to prevent watchdog issues
-  delay(10);
+  // AsyncWebServer handles clients asynchronously
 }
