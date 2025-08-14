@@ -340,22 +340,8 @@ const char indexHTML[] PROGMEM = R"rawliteral(
     </div>
   </section>
 </main>
-
 <script>
   let ws;
-
-  function initWebSocket() {
-    ws = new WebSocket('ws://' + window.location.host + '/ws');
-    ws.onmessage = function(evt) {
-      let data = JSON.parse(evt.data);
-      document.getElementById("voltage").innerText = data.voltage.toFixed(2);
-      document.getElementById("current").innerText = data.current.toFixed(2);
-      document.getElementById("power").innerText = data.power.toFixed(2);
-      document.getElementById("motorSpeed").value = data.motorSpeed;
-      document.getElementById("uvToggle").checked = data.uvOn;
-      document.getElementById("recipeStatus").innerText = data.running ? 'Yes' : 'No';
-    };
-  }
 
   function showSection(id) {
     const sections = document.querySelectorAll('.section');
@@ -373,6 +359,19 @@ const char indexHTML[] PROGMEM = R"rawliteral(
     buttons.forEach(button => {
       button.classList.toggle('active', button.textContent.replace(/\s+/g, '').toLowerCase() === id.toLowerCase());
     });
+  }
+
+  function initWebSocket() {
+    ws = new WebSocket('ws://' + window.location.host + '/ws');
+    ws.onmessage = function(evt) {
+      let data = JSON.parse(evt.data);
+      document.getElementById("voltage").innerText = data.voltage.toFixed(2);
+      document.getElementById("current").innerText = data.current.toFixed(2);
+      document.getElementById("power").innerText = data.power.toFixed(2);
+      document.getElementById("motorSpeed").value = data.motorSpeed;
+      document.getElementById("uvToggle").checked = data.uvOn;
+      document.getElementById("recipeStatus").innerText = data.running ? 'Yes' : 'No';
+    };
   }
 
   function updateMotorSpeed() {
@@ -457,7 +456,7 @@ const char indexHTML[] PROGMEM = R"rawliteral(
   }
 
   function toggleRecipeDetails(index) {
-    const el = document.getElementById(details-${index});
+    const el = document.getElementById(`details-${index}`);
     const parent = el.parentElement;
     const isShown = el.style.display === 'block';
     el.style.display = isShown ? 'none' : 'block';
@@ -497,7 +496,7 @@ const char indexHTML[] PROGMEM = R"rawliteral(
           method: 'POST',
           headers: {'Content-Type':'application/json'},
           body: JSON.stringify({speed: r.speed, time: r.time})
-        }).then(() => alert(Recipe started! Motor will run for ${r.time} seconds.));
+        }).then(() => alert(`Recipe started! Motor will run for ${r.time} seconds.`));
       }
     });
   }
