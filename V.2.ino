@@ -35,6 +35,7 @@ h2{text-align:center;}
 )rawliteral";
 
 // ================== MAIN DASHBOARD PAGE ==================
+// The main HTML now references an external script at /app.js to avoid inline parsing issues
 const char indexHTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -279,9 +280,9 @@ const char indexHTML[] PROGMEM = R"rawliteral(
 <header>Smart Mixer Grinder</header>
 
 <div class="menu" role="tablist">
-  <button class="active" onclick="showSection('home')" role="tab" aria-selected="true" aria-controls="home">Home</button>
-  <button onclick="showSection('myrecipes')" role="tab" aria-selected="false" aria-controls="myrecipes">My Recipes</button>
-  <button onclick="showSection('publicrecipes')" role="tab" aria-selected="false" aria-controls="publicrecipes">Public Recipes</button>
+  <button class="active" id="tab-home" data-target="home" role="tab" aria-selected="true" aria-controls="home">Home</button>
+  <button id="tab-myrecipes" data-target="myrecipes" role="tab" aria-selected="false" aria-controls="myrecipes">My Recipes</button>
+  <button id="tab-publicrecipes" data-target="publicrecipes" role="tab" aria-selected="false" aria-controls="publicrecipes">Public Recipes</button>
 </div>
 
 <main>
@@ -319,7 +320,7 @@ const char indexHTML[] PROGMEM = R"rawliteral(
           <input type="text" placeholder="Calories" class="ingredientCalories" required aria-label="Calories per ingredient" />
         </div>
       </div>
-      <button class="action" type="button" onclick="addIngredientRow()" aria-label="Add another ingredient">Add Ingredient</button>
+      <button class="action" type="button" id="addIngredientBtn" aria-label="Add another ingredient">Add Ingredient</button>
       <input type="number" id="servingSize" placeholder="Serving Size" aria-label="Serving size" />
       <select id="recipeMotorSpeed" aria-label="Select motor speed for recipe">
         <option value="1">Level 1 (30%)</option>
@@ -327,7 +328,7 @@ const char indexHTML[] PROGMEM = R"rawliteral(
         <option value="3">Level 3 (100%)</option>
       </select>
       <input type="number" id="recipeTime" placeholder="Run Time (seconds)" aria-label="Recipe run time in seconds" />
-      <button class="action" onclick="saveRecipe()" aria-label="Save recipe">Save Recipe</button>
+      <button class="action" id="saveRecipeBtn" aria-label="Save recipe">Save Recipe</button>
     </div>
     <div id="recipeList" aria-live="polite" aria-atomic="true" aria-label="List of saved recipes"></div>
   </section>
@@ -335,206 +336,365 @@ const char indexHTML[] PROGMEM = R"rawliteral(
   <section id="publicrecipes" class="section" role="tabpanel" tabindex="0" aria-hidden="true">
     <div class="card">
       <h2>Public Recipes</h2>
-      <button class="action" onclick="loadPublicRecipes()" aria-label="Load recipes from internet">Load from Internet</button>
+      <button class="action" id="loadPublicBtn" aria-label="Load recipes from internet">Load from Internet</button>
       <div id="publicList" aria-live="polite" aria-atomic="true"></div>
     </div>
   </section>
 </main>
-<script>
-  let ws;
 
-  function showSection(id) {
-    const sections = document.querySelectorAll('.section');
-    const buttons = document.querySelectorAll('.menu button');
-    sections.forEach(section => {
-      if (section.id === id) {
-        section.classList.add('active');
-        section.setAttribute('aria-hidden', 'false');
-        section.focus();
-      } else {
-        section.classList.remove('active');
-        section.setAttribute('aria-hidden', 'true');
-      }
-    });
-    buttons.forEach(button => {
-      button.classList.toggle('active', button.textContent.replace(/\s+/g, '').toLowerCase() === id.toLowerCase());
-    });
-  }
-
-  function initWebSocket() {
-    ws = new WebSocket('ws://' + window.location.host + '/ws');
-    ws.onmessage = function(evt) {
-      let data = JSON.parse(evt.data);
-      document.getElementById("voltage").innerText = data.voltage.toFixed(2);
-      document.getElementById("current").innerText = data.current.toFixed(2);
-      document.getElementById("power").innerText = data.power.toFixed(2);
-      document.getElementById("motorSpeed").value = data.motorSpeed;
-      document.getElementById("uvToggle").checked = data.uvOn;
-      document.getElementById("recipeStatus").innerText = data.running ? 'Yes' : 'No';
-    };
-  }
-
-  function updateMotorSpeed() {
-    let val = parseInt(document.getElementById('motorSpeed').value);
-    ws.send(JSON.stringify({motorSpeed: val}));
-  }
-
-  function updateUV() {
-    let on = document.getElementById('uvToggle').checked;
-    ws.send(JSON.stringify({uvOn: on}));
-  }
-
-  function addIngredientRow() {
-    const container = document.getElementById('ingredientList');
-    const row = document.createElement('div');
-    row.className = 'ingredient-row';
-    row.innerHTML = `
-      <input type="text" placeholder="Ingredient Name" class="ingredientName" required aria-label="Ingredient name" />
-      <input type="text" placeholder="Weight" class="ingredientWeight" required aria-label="Ingredient weight in grams" />
-      <input type="text" placeholder="Calories" class="ingredientCalories" required aria-label="Calories per ingredient" />
-      <button type="button" onclick="removeIngredientRow(this)" style="background:#ed2e3e;color:#fff;border:none;border-radius:20px;padding:0 12px;cursor:pointer;font-weight:bold;" aria-label="Remove ingredient">&times;</button>
-    `;
-    container.appendChild(row);
-  }
-
-  function removeIngredientRow(button) {
-    button.parentNode.remove();
-  }
-
-  function saveRecipe() {
-    let name = document.getElementById('recipeName').value.trim();
-    if (!name) { alert("Please enter a Recipe Name"); return; }
-    const names = document.querySelectorAll('.ingredientName');
-    const weights = document.querySelectorAll('.ingredientWeight');
-    const calories = document.querySelectorAll('.ingredientCalories');
-    let ingredients = [];
-    for (let i = 0; i < names.length; i++) {
-      if (names[i].value.trim() === '') continue;
-      ingredients.push({
-        name: names[i].value.trim(),
-        weight: weights[i].value.trim(),
-        calories: calories[i].value.trim()
-      });
-    }
-    let serving = parseInt(document.getElementById('servingSize').value);
-    let speed = parseInt(document.getElementById('recipeMotorSpeed').value);
-    let time = parseInt(document.getElementById('recipeTime').value);
-    fetch('/api/recipes').then(r => r.json()).then(recipes => {
-      recipes.push({ name, ingredients, serving, speed, time });
-      return fetch('/api/recipes', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(recipes)
-      });
-    }).then(() => { loadRecipes(); alert("Recipe saved!"); })
-      .catch(e => alert("Error saving recipe: " + e));
-  }
-
-  function loadRecipes() {
-    fetch('/api/recipes').then(r => r.json()).then(recipes => {
-      let html = '';
-      recipes.forEach((r,i) => {
-        const totalCal = r.ingredients.reduce((a,b) => a + parseFloat(b.calories || 0), 0);
-        html += `
-        <div class="recipe" onclick="toggleRecipeDetails(${i})" tabindex="0" role="button" aria-expanded="false" aria-controls="details-${i}">
-          <div class="recipe-header"><b>${r.name}</b></div>
-          <div class="recipe-subheader">${totalCal.toFixed(1)} Cal • Serving Size: ${r.serving}</div>
-          <div id="details-${i}" class="recipe-details" style="display:none;">
-            <button onclick="runRecipe(${i});event.stopPropagation();" class="run-button" aria-label="Run recipe ${r.name}">Run</button>
-            <button onclick="deleteRecipe(${i});event.stopPropagation();" class="delete-button" aria-label="Delete recipe ${r.name}">Delete</button>
-            <button onclick="uploadPublicRecipe(${i});event.stopPropagation();" class="upload-button" aria-label="Upload recipe ${r.name} to public">Upload to Public</button>
-            <br><br>
-            <b>Speed Level:</b> ${r.speed}<br>
-            <b>Run Time:</b> ${r.time} seconds<br>
-            <b>Ingredients:</b><br>
-            ${r.ingredients.map(ing => `- ${ing.name} ${ing.weight}g, ${ing.calories} Cal`).join('<br>')}
-          </div>
-        </div>`;
-      });
-      document.getElementById('recipeList').innerHTML = html;
-    });
-  }
-
-  function toggleRecipeDetails(index) {
-    const el = document.getElementById(`details-${index}`);
-    const parent = el.parentElement;
-    const isShown = el.style.display === 'block';
-    el.style.display = isShown ? 'none' : 'block';
-    parent.setAttribute('aria-expanded', !isShown);
-  }
-
-  function uploadPublicRecipe(index) {
-    fetch('/api/recipes').then(r => r.json()).then(recipes => {
-      if (index >= 0 && index < recipes.length) {
-        const recipe = recipes[index];
-        return fetch('/api/public', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify(recipe)
-        });
-      }
-    }).then(() => { alert("Recipe uploaded to Public (stub)!"); })
-      .catch(err => alert("Error uploading recipe: " + err));
-  }
-
-  function deleteRecipe(index) {
-    fetch('/api/recipes').then(r => r.json()).then(recipes => {
-      recipes.splice(index, 1);
-      return fetch('/api/recipes', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(recipes)
-      });
-    }).then(() => loadRecipes());
-  }
-
-  function runRecipe(index) {
-    fetch('/api/recipes').then(r => r.json()).then(recipes => {
-      if (index >= 0 && index < recipes.length) {
-        let r = recipes[index];
-        fetch('/api/runrecipe', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({speed: r.speed, time: r.time})
-        }).then(() => alert(`Recipe started! Motor will run for ${r.time} seconds.`));
-      }
-    });
-  }
-
-  function loadPublicRecipes() {
-    fetch('/api/public').then(r => r.json()).then(data => {
-      if (!Array.isArray(data)) data = [];
-      let html = '';
-      data.forEach(r => {
-        let totalCal = r.ingredients.reduce((a,b) => a + parseFloat(b.calories || 0), 0);
-        html += `<div class="recipe">
-          <b>${r.name}</b> - ${totalCal.toFixed(1)} Cal
-          <br><button onclick='importRecipe(${JSON.stringify(r)})' class="run-button">Import</button>
-        </div>`;
-      });
-      document.getElementById('publicList').innerHTML = html;
-    });
-  }
-
-  function importRecipe(recipe) {
-    fetch('/api/recipes').then(r => r.json()).then(recipes => {
-      recipes.push(recipe);
-      return fetch('/api/recipes', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(recipes)
-      });
-    }).then(() => alert("Imported!"));
-  }
-
-  window.onload = function() {
-    initWebSocket();
-    loadRecipes();
-  }
-</script>
+<!-- Load client JS from external endpoint to avoid parsing surprises -->
+<script src="/app.js"></script>
 
 </body>
 </html>
+)rawliteral";
+
+// ================== CLIENT JS (served at /app.js) ==================
+const char appJS[] PROGMEM = R"rawliteral(
+/* All JS avoids template literals/backticks to prevent accidental unclosed backtick errors.
+   This file intentionally uses string concatenation and createElement APIs. */
+
+var ws;
+var publicRecipes = [];
+
+function showSection(id) {
+  var sections = document.querySelectorAll('.section');
+  var buttons = document.querySelectorAll('.menu button');
+  for (var i = 0; i < sections.length; i++) {
+    var section = sections[i];
+    if (section.id === id) {
+      section.classList.add('active');
+      section.setAttribute('aria-hidden', 'false');
+      try { section.focus(); } catch (e) {}
+    } else {
+      section.classList.remove('active');
+      section.setAttribute('aria-hidden', 'true');
+    }
+  }
+  for (var j = 0; j < buttons.length; j++) {
+    var button = buttons[j];
+    var tgt = button.getAttribute('data-target');
+    if (tgt === id) {
+      button.classList.add('active');
+      button.setAttribute('aria-selected', 'true');
+    } else {
+      button.classList.remove('active');
+      button.setAttribute('aria-selected', 'false');
+    }
+  }
+}
+
+function initWebSocket() {
+  try {
+    ws = new WebSocket('ws://' + window.location.host + '/ws');
+    ws.onmessage = function(evt) {
+      try {
+        var data = JSON.parse(evt.data);
+        document.getElementById("voltage").innerText = (data.voltage || 0).toFixed(2);
+        document.getElementById("current").innerText = (data.current || 0).toFixed(2);
+        document.getElementById("power").innerText = (data.power || 0).toFixed(2);
+        document.getElementById("motorSpeed").value = data.motorSpeed || 0;
+        document.getElementById("uvToggle").checked = !!data.uvOn;
+        document.getElementById("recipeStatus").innerText = data.running ? 'Yes' : 'No';
+      } catch (e) {
+        console.error('WS parse error', e);
+      }
+    };
+    ws.onopen = function() { console.log('WS open'); };
+    ws.onclose = function() { console.log('WS closed'); };
+  } catch (e) {
+    console.error('WS init failed', e);
+  }
+}
+
+function updateMotorSpeed() {
+  var val = parseInt(document.getElementById('motorSpeed').value);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({motorSpeed: val}));
+  }
+}
+
+function updateUV() {
+  var on = document.getElementById('uvToggle').checked;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({uvOn: on}));
+  }
+}
+
+function createIngredientRow(name, weight, calories) {
+  var row = document.createElement('div');
+  row.className = 'ingredient-row';
+
+  var in1 = document.createElement('input');
+  in1.type = 'text';
+  in1.placeholder = 'Ingredient Name';
+  in1.className = 'ingredientName';
+  in1.setAttribute('aria-label', 'Ingredient name');
+  if (name) in1.value = name;
+
+  var in2 = document.createElement('input');
+  in2.type = 'text';
+  in2.placeholder = 'Weight';
+  in2.className = 'ingredientWeight';
+  in2.setAttribute('aria-label', 'Ingredient weight in grams');
+  if (weight) in2.value = weight;
+
+  var in3 = document.createElement('input');
+  in3.type = 'text';
+  in3.placeholder = 'Calories';
+  in3.className = 'ingredientCalories';
+  in3.setAttribute('aria-label', 'Calories per ingredient');
+  if (calories) in3.value = calories;
+
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.innerText = '×';
+  btn.style.background = '#ed2e3e';
+  btn.style.color = '#fff';
+  btn.style.border = 'none';
+  btn.style.borderRadius = '20px';
+  btn.style.padding = '0 12px';
+  btn.style.cursor = 'pointer';
+  btn.style.fontWeight = 'bold';
+  btn.setAttribute('aria-label', 'Remove ingredient');
+  btn.addEventListener('click', function() { row.remove(); });
+
+  row.appendChild(in1);
+  row.appendChild(in2);
+  row.appendChild(in3);
+  row.appendChild(btn);
+  return row;
+}
+
+function addIngredientRow() {
+  var container = document.getElementById('ingredientList');
+  var row = createIngredientRow();
+  container.appendChild(row);
+}
+
+function saveRecipe() {
+  var name = document.getElementById('recipeName').value.trim();
+  if (!name) { alert('Please enter a Recipe Name'); return; }
+  var names = document.querySelectorAll('.ingredientName');
+  var weights = document.querySelectorAll('.ingredientWeight');
+  var calories = document.querySelectorAll('.ingredientCalories');
+  var ingredients = [];
+  for (var i = 0; i < names.length; i++) {
+    if (names[i].value.trim() === '') continue;
+    ingredients.push({
+      name: names[i].value.trim(),
+      weight: weights[i].value.trim(),
+      calories: calories[i].value.trim()
+    });
+  }
+  var serving = parseInt(document.getElementById('servingSize').value) || 0;
+  var speed = parseInt(document.getElementById('recipeMotorSpeed').value) || 1;
+  var time = parseInt(document.getElementById('recipeTime').value) || 0;
+  fetch('/api/recipes').then(function(r){ return r.json(); }).then(function(recipes){
+    if (!Array.isArray(recipes)) recipes = [];
+    recipes.push({ name: name, ingredients: ingredients, serving: serving, speed: speed, time: time });
+    return fetch('/api/recipes', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(recipes)
+    });
+  }).then(function(){ loadRecipes(); alert('Recipe saved!'); })
+    .catch(function(e){ alert('Error saving recipe: ' + e); });
+}
+
+function loadRecipes() {
+  fetch('/api/recipes').then(function(r){ return r.json(); }).then(function(recipes){
+    if (!Array.isArray(recipes)) recipes = [];
+    var html = '';
+    for (var i = 0; i < recipes.length; i++) {
+      var r = recipes[i];
+      var totalCal = 0;
+      if (Array.isArray(r.ingredients)) {
+        for (var j = 0; j < r.ingredients.length; j++) {
+          totalCal += parseFloat(r.ingredients[j].calories || 0);
+        }
+      }
+      var ingredText = '';
+      if (Array.isArray(r.ingredients)) {
+        for (var k = 0; k < r.ingredients.length; k++) {
+          var ing = r.ingredients[k];
+          ingredText += '- ' + (ing.name || '') + ' ' + (ing.weight || '') + 'g, ' + (ing.calories || '') + ' Cal';
+          if (k < r.ingredients.length - 1) ingredText += '<br>';
+        }
+      }
+      html += '<div class=\"recipe\" tabindex=\"0\" role=\"button\" aria-expanded=\"false\" data-index=\"' + i + '\">'
+           + '<div class=\"recipe-header\"><b>' + (r.name || '') + '</b></div>'
+           + '<div class=\"recipe-subheader\">' + totalCal.toFixed(1) + ' Cal • Serving Size: ' + (r.serving || 0) + '</div>'
+           + '<div id=\"details-' + i + '\" class=\"recipe-details\" style=\"display:none;\">'
+           +   '<button class=\"run-button\" data-action=\"run\" data-index=\"' + i + '\">Run</button>'
+           +   '<button class=\"delete-button\" data-action=\"delete\" data-index=\"' + i + '\">Delete</button>'
+           +   '<button class=\"upload-button\" data-action=\"upload\" data-index=\"' + i + '\">Upload to Public</button>'
+           +   '<br><br>'
+           +   '<b>Speed Level:</b> ' + (r.speed || '') + '<br>'
+           +   '<b>Run Time:</b> ' + (r.time || '') + ' seconds<br>'
+           +   '<b>Ingredients:</b><br>' + ingredText
+           + '</div></div>';
+    }
+    document.getElementById('recipeList').innerHTML = html;
+
+    var recEls = document.querySelectorAll('.recipe');
+    for (var m = 0; m < recEls.length; m++) {
+      (function(el){
+        el.addEventListener('click', function(){
+          var idx = el.getAttribute('data-index');
+          var details = document.getElementById('details-' + idx);
+          var isShown = details.style.display === 'block';
+          details.style.display = isShown ? 'none' : 'block';
+          el.setAttribute('aria-expanded', !isShown);
+        });
+      })(recEls[m]);
+    }
+
+    var runBtns = document.querySelectorAll('[data-action=\"run\"]');
+    for (var n = 0; n < runBtns.length; n++) {
+      (function(btn){
+        btn.addEventListener('click', function(e){
+          e.stopPropagation();
+          var idx = parseInt(btn.getAttribute('data-index'));
+          runRecipe(idx);
+        });
+      })(runBtns[n]);
+    }
+
+    var delBtns = document.querySelectorAll('[data-action=\"delete\"]');
+    for (var p = 0; p < delBtns.length; p++) {
+      (function(btn){
+        btn.addEventListener('click', function(e){
+          e.stopPropagation();
+          var idx = parseInt(btn.getAttribute('data-index'));
+          deleteRecipe(idx);
+        });
+      })(delBtns[p]);
+    }
+
+    var upBtns = document.querySelectorAll('[data-action=\"upload\"]');
+    for (var q = 0; q < upBtns.length; q++) {
+      (function(btn){
+        btn.addEventListener('click', function(e){
+          e.stopPropagation();
+          var idx = parseInt(btn.getAttribute('data-index'));
+          uploadPublicRecipe(idx);
+        });
+      })(upBtns[q]);
+    }
+
+  }).catch(function(err){
+    console.error('Failed to load recipes', err);
+    document.getElementById('recipeList').innerHTML = '<div class=\"card\">No recipes or failed to load.</div>';
+  });
+}
+
+function uploadPublicRecipe(index) {
+  fetch('/api/recipes').then(function(r){ return r.json(); }).then(function(recipes){
+    if (!Array.isArray(recipes)) recipes = [];
+    if (index >= 0 && index < recipes.length) {
+      var recipe = recipes[index];
+      return fetch('/api/public', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(recipe)
+      });
+    }
+  }).then(function(){ alert('Recipe uploaded to Public (stub)!'); })
+    .catch(function(err){ alert('Error uploading recipe: ' + err); });
+}
+
+function deleteRecipe(index) {
+  fetch('/api/recipes').then(function(r){ return r.json(); }).then(function(recipes){
+    if (!Array.isArray(recipes)) recipes = [];
+    recipes.splice(index, 1);
+    return fetch('/api/recipes', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(recipes)
+    });
+  }).then(function(){ loadRecipes(); }).catch(function(err){ console.error(err); });
+}
+
+function runRecipe(index) {
+  fetch('/api/recipes').then(function(r){ return r.json(); }).then(function(recipes){
+    if (!Array.isArray(recipes)) recipes = [];
+    if (index >= 0 && index < recipes.length) {
+      var rec = recipes[index];
+      fetch('/api/runrecipe', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({speed: rec.speed, time: rec.time})
+      }).then(function(){ alert('Recipe started! Motor will run for ' + (rec.time || 0) + ' seconds.'); });
+    }
+  });
+}
+
+function loadPublicRecipes() {
+  fetch('/api/public').then(function(r){ return r.json(); }).then(function(data){
+    if (!Array.isArray(data)) data = [];
+    publicRecipes = data;
+    var html = '';
+    for (var i = 0; i < data.length; i++) {
+      var r = data[i];
+      var totalCal = 0;
+      if (Array.isArray(r.ingredients)) {
+        for (var j = 0; j < r.ingredients.length; j++) totalCal += parseFloat(r.ingredients[j].calories || 0);
+      }
+      html += '<div class=\"recipe\" data-public-index=\"' + i + '\">'
+           + '<b>' + (r.name || '') + '</b> - ' + totalCal.toFixed(1) + ' Cal'
+           + '<br><button class=\"run-button import-public\" data-idx=\"' + i + '\">Import</button>'
+           + '</div>';
+    }
+    document.getElementById('publicList').innerHTML = html;
+    var imBtns = document.querySelectorAll('.import-public');
+    for (var k = 0; k < imBtns.length; k++) {
+      (function(btn){
+        btn.addEventListener('click', function(){
+          var idx = parseInt(btn.getAttribute('data-idx'));
+          importRecipe(publicRecipes[idx]);
+        });
+      })(imBtns[k]);
+    }
+  }).catch(function(err){
+    console.error('Failed to load public recipes', err);
+    document.getElementById('publicList').innerHTML = '<div class=\"card\">No public recipes available.</div>';
+  });
+}
+
+function importRecipe(recipe) {
+  fetch('/api/recipes').then(function(r){ return r.json(); }).then(function(recipes){
+    if (!Array.isArray(recipes)) recipes = [];
+    recipes.push(recipe);
+    return fetch('/api/recipes', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(recipes)
+    });
+  }).then(function(){ loadRecipes(); alert('Imported!'); }).catch(function(err){ console.error(err); });
+}
+
+window.onload = function() {
+  var menuBtns = document.querySelectorAll('.menu button');
+  for (var i = 0; i < menuBtns.length; i++) {
+    (function(btn){
+      btn.addEventListener('click', function(){
+        var tgt = btn.getAttribute('data-target');
+        if (tgt) showSection(tgt);
+      });
+    })(menuBtns[i]);
+  }
+
+  var addBtn = document.getElementById('addIngredientBtn');
+  if (addBtn) addBtn.addEventListener('click', addIngredientRow);
+  var saveBtn = document.getElementById('saveRecipeBtn');
+  if (saveBtn) saveBtn.addEventListener('click', saveRecipe);
+  var loadPubBtn = document.getElementById('loadPublicBtn');
+  if (loadPubBtn) loadPubBtn.addEventListener('click', loadPublicRecipes);
+
+  initWebSocket();
+  loadRecipes();
+};
 )rawliteral";
 
 // ================== PINS & SETTINGS ==================
@@ -699,6 +859,18 @@ void startAPMode() {
 void setupAPIRoutes() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "text/html", indexHTML);
+  });
+
+  // serve the external JS file
+  server.on("/app.js", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "application/javascript", appJS);
+  });
+
+  // serve a small blank favicon so browser won't 404 repeatedly
+  server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest *request){
+    // Return a 1x1 transparent favicon (data URI not directly usable here),
+    // so just respond 204 No Content to silence logs/404s.
+    request->send(204, "image/x-icon", "");
   });
 
   ws.onEvent([](AsyncWebSocket *, AsyncWebSocketClient *, AwsEventType type,
