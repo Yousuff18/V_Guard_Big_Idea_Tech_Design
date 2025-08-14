@@ -1,226 +1,806 @@
-IMPLEMENTATION GUIDE (step-by-step, nothing assumed)
-
-A) Company Side (Airtable = admin UI + API with no code)
-
-1. Create Airtable account → airtable.com (free plan is fine).
-
-
-2. Create a Base named “Recipes”. Inside it create a Table named recipes.
-
-
-3. Make these Fields (column names, exact spellings):
-
-name → Single line text
-
-ingredients → Long text (paste JSON array here, example below)
-
-serving_size → Number (integer)
-
-speed_level → Number (integer; allowed values 1,2,3)
-
-timer → Number (integer; seconds)
-
-
-
-4. Add a few rows. For ingredients, paste JSON like:
-
-[
-  {"name":"Banana","weight":120,"calories":105},
-  {"name":"Milk","weight":200,"calories":103}
-]
-
-
-5. Get your Personal Access Token (API key):
-
-Airtable → Account → Developer hub → Personal access tokens → Create token.
-
-Give it read access to your “Recipes” base. Copy the token (keep it secret).
-
-
-
-6. Find your Base ID and Table Name:
-
-Open the base, click the “API” help or use the Developer hub to find BASE_ID.
-
-Table name is recipes (exact).
-
-
-
-7. Your API URL for listing recipes will be:
-
-https://api.airtable.com/v0/<BASE_ID>/recipes?pageSize=50&view=Grid%20view
-
-(Replace <BASE_ID> with your real one.)
-
-
-8. Keep these three things ready to paste into the ESP32 Settings page later:
-
-API URL (above)
-
-API Key (your personal access token)
-
-Allowed Domain = api.airtable.com
-
-
-
-
-> That’s it. Your staff can edit recipes directly in Airtable’s UI (nice and friendly). The ESP32 will read-only fetch from the API.
-
-
-
-
----
-
-B) ESP32 Side
-
-1) Install Arduino IDE + Board + Libraries
-
-Arduino IDE 2.x
-
-ESP32 board support: Boards Manager → search “esp32” → install “esp32 by Espressif” (2.x).
-
-Libraries: Sketch → Manage Libraries → install:
-
-WiFiManager by tzapu
-
-ESPAsyncWebServer (and AsyncTCP)
-
-ArduinoJson (v6)
-
-
-(No extra steps for SPIFFS on ESP32; it’s built into the core)
-
-
-2) Wire your outputs
-
-Connect GPIO 25 → your Speed 1 driver
-
-Connect GPIO 26 → your Speed 2 driver
-
-Connect GPIO 27 → your Speed 3 driver
-
-Do not power a motor directly from the ESP32 pin. Use a relay/triac driver.
-
-
-3) Flash the generated code
-
-Select Board: “ESP32 Dev Module” (or the exact DevKit you have).
-
-Select the right port.
-
-Compile & Upload.
-
-
-4) First-time setup (captive portal)
-
-Power the board.
-
-On your phone, connect to Wi-Fi ESP32_Setup (password: configureme).
-
-The portal should pop up; if not, open 192.168.4.1.
-
-Enter your home Wi-Fi SSID and password.
-
-ESP32 reboots and joins your Wi-Fi.
-
-
-5) Open the device UI
-
-On your phone (same Wi-Fi), visit http://esp32.local
-
-If mDNS doesn’t work on your phone, find the device IP from your router or serial monitor and browse http://<that-ip>.
-
-
-
-6) Configure the Company API
-
-Go to Settings in the ESP32 UI.
-
-Paste your API URL (from step A7).
-
-Paste your API Key.
-
-Allowed Domain: api.airtable.com.
-
-(Optional) Set a Device PIN (e.g., 1234) to protect “Run/Save/Delete/Factory Reset/Settings” actions.
-
-Click Save.
-
-Click Test API; you should see “Success” if your Airtable has rows and the token is correct.
-
-
-7) Use it
-
-Company Recipes page → tap Refresh → cards should load.
-
-Tap Run Now to run without saving.
-
-Tap Add to My Recipes to copy it into ESP32 local storage.
-
-My Recipes page → your saved recipes appear.
-
-Home → use Off / Speed 1 / Speed 2 / Speed 3. Only one stays active.
-
-When a recipe runs, it auto-stops after its timer.
-
-
-8) Change Wi-Fi later
-
-If the router changes, ESP32 will fail to join and automatically fall back to AP setup again.
-
-Alternatively, use Settings → Factory Reset (you’ll need to confirm) to erase and re-onboard.
-
-
-
----
-
-C) Troubleshooting & sanity checks
-
-No recipes showing?
-
-Settings → Test API.
-
-Verify API Key, Base ID, Table name (recipes), Allowed Domain = api.airtable.com.
-
-Ensure you have at least one row in Airtable and that ingredients is valid JSON.
-
-
-Compile errors “missing AsyncTCP / ESPAsyncWebServer”?
-
-Install both libraries; restart Arduino IDE.
-
-
-ESP32 not at esp32.local?
-
-Try the raw IP (from Serial Monitor or router).
-
-Some Androids need an mDNS app; IP always works.
-
-
-Airtable HTTPS certificate issue?
-
-Use the Quickstart (unsafe) TLS mode first (the code will have a USE_INSECURE_TLS flag).
-
-Later, switch to Production (safe) and paste the Airtable root cert string where indicated in the code comments.
-
-
-UI says “PIN required”
-
-Add header X-Device-PIN: 1234 in requests (the built-in UI will handle this automatically once you set it).
-
-
-
-
----
-
-D) Optional: change backend later (no code rewrite)
-
-If you ever move away from Airtable to a plain JSON file or another service, you’ll only change two things in code (clearly commented in the prompt’s output):
-
-1. The fetch function (URL + headers)
-
-
-2. The normalization function (map remote fields → name, ingredients[], serving_size, speed_level, timer)
-
-
-
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <ArduinoJson.h>
+#include "EmonLib.h"
+#include <Preferences.h>
+#include "driver/ledc.h"
+
+// ================== EMBEDDED WEB UI ==================
+// WiFi setup page
+const char wifiSetupHTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WiFi Setup - Mixer Grinder</title>
+<style>
+body{font-family:Arial,sans-serif;background:#f8f8f8;}
+.container{max-width:350px;margin:auto;margin-top:40px;background:#fff;
+padding:20px;border-radius:8px;box-shadow:0 0 5px rgba(0,0,0,0.1);}
+input{width:100%;padding:10px;margin:6px 0;box-sizing:border-box;}
+button{padding:10px;background:#4CAF50;border:none;color:#fff;width:100%;
+border-radius:4px;font-size:16px;}
+h2{text-align:center;}
+</style>
+</head><body>
+<div class="container">
+<h2>WiFi Setup</h2>
+<form action="/savewifi" method="POST">
+<input type="text" name="ssid" placeholder="WiFi SSID" required>
+<input type="password" name="pass" placeholder="Password" required>
+<button type="submit">Save & Connect</button>
+</form>
+</div>
+</body></html>
+)rawliteral";
+
+// ================== MAIN DASHBOARD PAGE ==================
+const char indexHTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Smart Mixer Grinder</title>
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet"/>
+<style>
+  /* Reset and base */
+  * {
+    box-sizing: border-box;
+  }
+  body {
+    margin: 0; padding: 0; background: #f8fafc;
+    font-family: 'Roboto', sans-serif;
+    color: #223344;
+    line-height: 1.5;
+  }
+  header {
+    background-color: #0052cc;
+    color: white;
+    font-weight: 700;
+    font-size: 1.8rem;
+    padding: 20px 0;
+    text-align: center;
+    letter-spacing: 1.2px;
+    box-shadow: 0 4px 8px rgba(0, 82, 204, 0.3);
+  }
+  .menu {
+    display: flex;
+    background-color: #0a4da0;
+    box-shadow: 0 2px 6px rgba(0, 82, 204, 0.25);
+  }
+  .menu button {
+    flex: 1;
+    background: none;
+    border: none;
+    color: #cbd3db;
+    padding: 16px 0;
+    font-size: 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: color 0.3s ease, border-bottom 0.3s ease;
+    border-bottom: 3px solid transparent;
+  }
+  .menu button:hover {
+    color: white;
+  }
+  .menu button.active {
+    color: white;
+    border-bottom: 3px solid #ffd600;
+  }
+
+  main {
+    max-width: 900px;
+    margin: 25px auto;
+    padding: 0 15px;
+  }
+
+  .section {
+    display: none;
+    animation: fadeIn 0.35s ease forwards;
+  }
+  .section.active {
+    display: block;
+  }
+  @keyframes fadeIn {
+    from {opacity: 0;}
+    to {opacity: 1;}
+  }
+
+  /* Card container */
+  .card {
+    background: white;
+    border-radius: 12px;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.08);
+    padding: 24px;
+    margin-bottom: 30px;
+    transition: box-shadow 0.3s ease;
+  }
+  .card:hover {
+    box-shadow: 0 14px 28px rgba(0,0,0,0.12);
+  }
+  
+  /* Headings */
+  h2 {
+    margin-top: 0; 
+    font-weight: 700; 
+    color: #003a99;
+  }
+
+  /* Inputs and selects */
+  input[type=text], input[type=number], select, textarea {
+    width: 100%;
+    font-size: 1rem;
+    padding: 14px 16px;
+    margin-top: 10px;
+    border: 1.5px solid #cbd3db;
+    border-radius: 8px;
+    transition: border-color 0.3s ease;
+    font-weight: 400;
+    color: #223344;
+  }
+  input[type=text]:focus, input[type=number]:focus, select:focus, textarea:focus {
+    border-color: #0052cc;
+    outline: none;
+  }
+
+  /* Buttons */
+  button {
+    font-weight: 600;
+    border-radius: 30px;
+    padding: 14px 30px;
+    font-size: 1rem;
+    cursor: pointer;
+    border: none;
+    box-shadow: 0 10px 20px rgba(0, 82, 204, 0.3);
+    transition: background 0.3s ease, box-shadow 0.3s ease;
+  }
+
+  button.action {
+    background: linear-gradient(135deg, #0052cc, #003a99);
+    color: white;
+    margin-top: 20px;
+  }
+  button.action:hover {
+    background: linear-gradient(135deg, #003a99, #002766);
+    box-shadow: 0 14px 28px rgba(0, 58, 153, 0.5);
+  }
+
+  button.run-button {
+    background: #ffd600;
+    color: #003a99;
+    padding: 8px 22px;
+    border-radius: 20px;
+    font-weight: 700;
+    box-shadow: 0 6px 14px rgba(255, 214, 0, 0.6);
+    border: 2px solid #ffaa00;
+  }
+  button.run-button:hover {
+    background: #ffb700;
+    box-shadow: 0 8px 18px rgba(255, 184, 0, 0.8);
+  }
+
+  button.delete-button {
+    background: #ed2e3e;
+    color: white;
+    padding: 8px 20px;
+    border-radius: 20px;
+    font-weight: 700;
+    box-shadow: 0 6px 14px rgba(237, 46, 62, 0.6);
+    border: none;
+    margin-left: 12px;
+  }
+  button.delete-button:hover {
+    background: #c82333;
+    box-shadow: 0 8px 18px rgba(200, 35, 51, 0.8);
+  }
+  
+  button.upload-button {
+    background: #5a9df9;
+    color: white;
+    padding: 8px 20px;
+    border-radius: 20px;
+    font-weight: 700;
+    box-shadow: 0 6px 14px rgba(90, 157, 249, 0.6);
+    border: none;
+    margin-left: 12px;
+  }
+  button.upload-button:hover {
+    background: #3c7ee9;
+    box-shadow: 0 8px 18px rgba(60, 126, 233, 0.8);
+  }
+
+  /* Toggle style */
+  .toggle {
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+  }
+  .toggle input[type=checkbox] {
+    width: 18px;
+    height: 18px;
+    margin-left: 12px;
+    cursor: pointer;
+  }
+
+  /* Stats */
+  .stats {
+    font-size: 1.1rem;
+    color: #33475b;
+  }
+
+  /* Recipe cards */
+  .recipe {
+    background: #ffffff;
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+    box-shadow: 0 3px 14px rgba(0,0,0,0.06);
+    cursor: pointer;
+    transition: background-color 0.25s ease;
+  }
+  .recipe:hover {
+    background-color: #e6f0ff;
+  }
+  .recipe-header {
+    font-weight: 700;
+    font-size: 1.15rem;
+    color: #004bbd;
+    line-height: 1.3;
+  }
+  .recipe-subheader {
+    font-size: 0.9rem;
+    color: #66788a;
+    margin-top: 4px;
+  }
+  .recipe-details {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid #dde6f2;
+    font-size: 0.95rem;
+    color: #4a6785;
+  }
+
+  /* Ingredient row */
+  .ingredient-row {
+    display: flex;
+    gap: 12px;
+    margin-top: 10px;
+  }
+  .ingredient-row input {
+    flex: 1;
+    font-size: 1rem;
+  }
+  
+</style>
+</head>
+<body>
+
+<header>Smart Mixer Grinder</header>
+
+<div class="menu" role="tablist">
+  <button class="active" onclick="showSection('home')" role="tab" aria-selected="true" aria-controls="home">Home</button>
+  <button onclick="showSection('myrecipes')" role="tab" aria-selected="false" aria-controls="myrecipes">My Recipes</button>
+  <button onclick="showSection('publicrecipes')" role="tab" aria-selected="false" aria-controls="publicrecipes">Public Recipes</button>
+</div>
+
+<main>
+  <section id="home" class="section active" role="tabpanel" tabindex="0">
+    <div class="card">
+      <h2>Motor Speed</h2>
+      <select id="motorSpeed" onchange="updateMotorSpeed()" aria-label="Select motor speed level">
+        <option value="0">Off</option>
+        <option value="1">Level 1 (30%)</option>
+        <option value="2">Level 2 (60%)</option>
+        <option value="3">Level 3 (100%)</option>
+      </select>
+      <h2>UV Sterilization</h2>
+      <label class="toggle" for="uvToggle">Enable UV
+        <input type="checkbox" id="uvToggle" onchange="updateUV()" aria-checked="false" />
+      </label>
+    </div>
+    <div class="card stats" aria-live="polite" aria-atomic="true">
+      <h2>Power Stats</h2>
+      <p>Voltage: <strong><span id="voltage">--</span> V</strong></p>
+      <p>Current: <strong><span id="current">--</span> A</strong></p>
+      <p>Power: <strong><span id="power">--</span> W</strong></p>
+      <p>Recipe Running: <strong><span id="recipeStatus">No</span></strong></p>
+    </div>
+  </section>
+
+  <section id="myrecipes" class="section" role="tabpanel" tabindex="0" aria-hidden="true">
+    <div class="card" aria-label="Create new recipe">
+      <h2>Create Recipe</h2>
+      <input type="text" id="recipeName" placeholder="Recipe Name" aria-label="Recipe name" />
+      <div id="ingredientList" aria-live="polite" aria-relevant="additions removals">
+        <div class="ingredient-row">
+          <input type="text" placeholder="Ingredient Name" class="ingredientName" required aria-label="Ingredient name" />
+          <input type="text" placeholder="Weight" class="ingredientWeight" required aria-label="Ingredient weight in grams" />
+          <input type="text" placeholder="Calories" class="ingredientCalories" required aria-label="Calories per ingredient" />
+        </div>
+      </div>
+      <button class="action" type="button" onclick="addIngredientRow()" aria-label="Add another ingredient">Add Ingredient</button>
+      <input type="number" id="servingSize" placeholder="Serving Size" aria-label="Serving size" />
+      <select id="recipeMotorSpeed" aria-label="Select motor speed for recipe">
+        <option value="1">Level 1 (30%)</option>
+        <option value="2">Level 2 (60%)</option>
+        <option value="3">Level 3 (100%)</option>
+      </select>
+      <input type="number" id="recipeTime" placeholder="Run Time (seconds)" aria-label="Recipe run time in seconds" />
+      <button class="action" onclick="saveRecipe()" aria-label="Save recipe">Save Recipe</button>
+    </div>
+    <div id="recipeList" aria-live="polite" aria-atomic="true" aria-label="List of saved recipes"></div>
+  </section>
+
+  <section id="publicrecipes" class="section" role="tabpanel" tabindex="0" aria-hidden="true">
+    <div class="card">
+      <h2>Public Recipes</h2>
+      <button class="action" onclick="loadPublicRecipes()" aria-label="Load recipes from internet">Load from Internet</button>
+      <div id="publicList" aria-live="polite" aria-atomic="true"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+  let ws;
+
+  function initWebSocket() {
+    ws = new WebSocket('ws://' + window.location.host + '/ws');
+    ws.onmessage = function(evt) {
+      let data = JSON.parse(evt.data);
+      document.getElementById("voltage").innerText = data.voltage.toFixed(2);
+      document.getElementById("current").innerText = data.current.toFixed(2);
+      document.getElementById("power").innerText = data.power.toFixed(2);
+      document.getElementById("motorSpeed").value = data.motorSpeed;
+      document.getElementById("uvToggle").checked = data.uvOn;
+      document.getElementById("recipeStatus").innerText = data.running ? 'Yes' : 'No';
+    };
+  }
+
+  function showSection(id) {
+    const sections = document.querySelectorAll('.section');
+    const buttons = document.querySelectorAll('.menu button');
+    sections.forEach(section => {
+      if (section.id === id) {
+        section.classList.add('active');
+        section.setAttribute('aria-hidden', 'false');
+        section.focus();
+      } else {
+        section.classList.remove('active');
+        section.setAttribute('aria-hidden', 'true');
+      }
+    });
+    buttons.forEach(button => {
+      button.classList.toggle('active', button.textContent.replace(/\s+/g, '').toLowerCase() === id.toLowerCase());
+    });
+  }
+
+  function updateMotorSpeed() {
+    let val = parseInt(document.getElementById('motorSpeed').value);
+    ws.send(JSON.stringify({motorSpeed: val}));
+  }
+
+  function updateUV() {
+    let on = document.getElementById('uvToggle').checked;
+    ws.send(JSON.stringify({uvOn: on}));
+  }
+
+  function addIngredientRow() {
+    const container = document.getElementById('ingredientList');
+    const row = document.createElement('div');
+    row.className = 'ingredient-row';
+    row.innerHTML = `
+      <input type="text" placeholder="Ingredient Name" class="ingredientName" required aria-label="Ingredient name" />
+      <input type="text" placeholder="Weight" class="ingredientWeight" required aria-label="Ingredient weight in grams" />
+      <input type="text" placeholder="Calories" class="ingredientCalories" required aria-label="Calories per ingredient" />
+      <button type="button" onclick="removeIngredientRow(this)" style="background:#ed2e3e;color:#fff;border:none;border-radius:20px;padding:0 12px;cursor:pointer;font-weight:bold;" aria-label="Remove ingredient">&times;</button>
+    `;
+    container.appendChild(row);
+  }
+
+  function removeIngredientRow(button) {
+    button.parentNode.remove();
+  }
+
+  function saveRecipe() {
+    let name = document.getElementById('recipeName').value.trim();
+    if (!name) { alert("Please enter a Recipe Name"); return; }
+    const names = document.querySelectorAll('.ingredientName');
+    const weights = document.querySelectorAll('.ingredientWeight');
+    const calories = document.querySelectorAll('.ingredientCalories');
+    let ingredients = [];
+    for (let i = 0; i < names.length; i++) {
+      if (names[i].value.trim() === '') continue;
+      ingredients.push({
+        name: names[i].value.trim(),
+        weight: weights[i].value.trim(),
+        calories: calories[i].value.trim()
+      });
+    }
+    let serving = parseInt(document.getElementById('servingSize').value);
+    let speed = parseInt(document.getElementById('recipeMotorSpeed').value);
+    let time = parseInt(document.getElementById('recipeTime').value);
+    fetch('/api/recipes').then(r => r.json()).then(recipes => {
+      recipes.push({ name, ingredients, serving, speed, time });
+      return fetch('/api/recipes', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(recipes)
+      });
+    }).then(() => { loadRecipes(); alert("Recipe saved!"); })
+      .catch(e => alert("Error saving recipe: " + e));
+  }
+
+  function loadRecipes() {
+    fetch('/api/recipes').then(r => r.json()).then(recipes => {
+      let html = '';
+      recipes.forEach((r,i) => {
+        const totalCal = r.ingredients.reduce((a,b) => a + parseFloat(b.calories || 0), 0);
+        html += `
+        <div class="recipe" onclick="toggleRecipeDetails(${i})" tabindex="0" role="button" aria-expanded="false" aria-controls="details-${i}">
+          <div class="recipe-header"><b>${r.name}</b></div>
+          <div class="recipe-subheader">${totalCal.toFixed(1)} Cal • Serving Size: ${r.serving}</div>
+          <div id="details-${i}" class="recipe-details" style="display:none;">
+            <button onclick="runRecipe(${i});event.stopPropagation();" class="run-button" aria-label="Run recipe ${r.name}">Run</button>
+            <button onclick="deleteRecipe(${i});event.stopPropagation();" class="delete-button" aria-label="Delete recipe ${r.name}">Delete</button>
+            <button onclick="uploadPublicRecipe(${i});event.stopPropagation();" class="upload-button" aria-label="Upload recipe ${r.name} to public">Upload to Public</button>
+            <br><br>
+            <b>Speed Level:</b> ${r.speed}<br>
+            <b>Run Time:</b> ${r.time} seconds<br>
+            <b>Ingredients:</b><br>
+            ${r.ingredients.map(ing => `- ${ing.name} ${ing.weight}g, ${ing.calories} Cal`).join('<br>')}
+          </div>
+        </div>`;
+      });
+      document.getElementById('recipeList').innerHTML = html;
+    });
+  }
+
+  function toggleRecipeDetails(index) {
+    const el = document.getElementById(details-${index});
+    const parent = el.parentElement;
+    const isShown = el.style.display === 'block';
+    el.style.display = isShown ? 'none' : 'block';
+    parent.setAttribute('aria-expanded', !isShown);
+  }
+
+  function uploadPublicRecipe(index) {
+    fetch('/api/recipes').then(r => r.json()).then(recipes => {
+      if (index >= 0 && index < recipes.length) {
+        const recipe = recipes[index];
+        return fetch('/api/public', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(recipe)
+        });
+      }
+    }).then(() => { alert("Recipe uploaded to Public (stub)!"); })
+      .catch(err => alert("Error uploading recipe: " + err));
+  }
+
+  function deleteRecipe(index) {
+    fetch('/api/recipes').then(r => r.json()).then(recipes => {
+      recipes.splice(index, 1);
+      return fetch('/api/recipes', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(recipes)
+      });
+    }).then(() => loadRecipes());
+  }
+
+  function runRecipe(index) {
+    fetch('/api/recipes').then(r => r.json()).then(recipes => {
+      if (index >= 0 && index < recipes.length) {
+        let r = recipes[index];
+        fetch('/api/runrecipe', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({speed: r.speed, time: r.time})
+        }).then(() => alert(Recipe started! Motor will run for ${r.time} seconds.));
+      }
+    });
+  }
+
+  function loadPublicRecipes() {
+    fetch('/api/public').then(r => r.json()).then(data => {
+      if (!Array.isArray(data)) data = [];
+      let html = '';
+      data.forEach(r => {
+        let totalCal = r.ingredients.reduce((a,b) => a + parseFloat(b.calories || 0), 0);
+        html += `<div class="recipe">
+          <b>${r.name}</b> - ${totalCal.toFixed(1)} Cal
+          <br><button onclick='importRecipe(${JSON.stringify(r)})' class="run-button">Import</button>
+        </div>`;
+      });
+      document.getElementById('publicList').innerHTML = html;
+    });
+  }
+
+  function importRecipe(recipe) {
+    fetch('/api/recipes').then(r => r.json()).then(recipes => {
+      recipes.push(recipe);
+      return fetch('/api/recipes', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(recipes)
+      });
+    }).then(() => alert("Imported!"));
+  }
+
+  window.onload = function() {
+    initWebSocket();
+    loadRecipes();
+  }
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// ================== PINS & SETTINGS ==================
+#define MOTOR_PIN 25
+#define UV_PIN 26
+
+#define PWM_FREQ 5000
+#define PWM_RES 8
+
+#define V1 34
+#define I1 35
+#define CV1 1000
+#define CI1 1000
+
+Preferences preferences;
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+EnergyMonitor emon1;
+
+bool isSTA = false;
+
+uint8_t motorSpeedLevel = 0;
+bool uvOn = false;
+String recipesJSON = "[]";
+
+bool recipeRunning = false;
+unsigned long recipeEndTime = 0;
+
+ledc_timer_config_t ledc_timer;
+ledc_channel_config_t ledc_channel;
+
+// ================== FUNCTIONS ==================
+void setupPWM() {
+  ledc_timer.speed_mode = LEDC_HIGH_SPEED_MODE;
+  ledc_timer.timer_num = LEDC_TIMER_0;
+  ledc_timer.duty_resolution = (ledc_timer_bit_t)PWM_RES;
+  ledc_timer.freq_hz = PWM_FREQ;
+  ledc_timer.clk_cfg = LEDC_AUTO_CLK;
+  ledc_timer_config(&ledc_timer);
+
+  ledc_channel.speed_mode = LEDC_HIGH_SPEED_MODE;
+  ledc_channel.channel = LEDC_CHANNEL_0;
+  ledc_channel.timer_sel = LEDC_TIMER_0;
+  ledc_channel.intr_type = LEDC_INTR_DISABLE;
+  ledc_channel.gpio_num = MOTOR_PIN;
+  ledc_channel.duty = 0;
+  ledc_channel.hpoint = 0;
+  ledc_channel_config(&ledc_channel);
+}
+
+void setPWMDuty(uint8_t duty) {
+  ledc_set_duty(ledc_channel.speed_mode, ledc_channel.channel, duty);
+  ledc_update_duty(ledc_channel.speed_mode, ledc_channel.channel);
+}
+
+void setMotorSpeed(uint8_t level) {
+  uint8_t duty = 0;
+  if (level == 1) duty = 76;
+  else if (level == 2) duty = 153;
+  else if (level == 3) duty = 255;
+  motorSpeedLevel = level;
+  setPWMDuty(duty);
+}
+
+void setUV(bool on) {
+  uvOn = on;
+  digitalWrite(UV_PIN, uvOn ? HIGH : LOW);
+}
+
+String getPowerDataJSON() {
+  emon1.calcVI(20, 2000);
+  float voltage = emon1.Vrms;
+  float current = emon1.Irms;
+  float power = voltage * current;
+  StaticJsonDocument<256> doc;
+  doc["voltage"] = voltage;
+  doc["current"] = current;
+  doc["power"] = power;
+  doc["motorSpeed"] = motorSpeedLevel;
+  doc["uvOn"] = uvOn;
+  doc["running"] = recipeRunning;
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+void saveRecipesToFlash() {
+  preferences.begin("recipes", false);
+  preferences.putString("data", recipesJSON);
+  preferences.end();
+}
+
+void loadRecipesFromFlash() {
+  preferences.begin("recipes", true);
+  recipesJSON = preferences.getString("data", "[]");
+  preferences.end();
+}
+
+// ===== WiFi =====
+String savedSSID, savedPASS;
+
+void saveWiFiCredentials(String ssid, String pass) {
+  preferences.begin("wifi", false);
+  preferences.putString("ssid", ssid);
+  preferences.putString("pass", pass);
+  preferences.end();
+}
+
+bool loadWiFiCredentials() {
+  preferences.begin("wifi", true);
+  savedSSID = preferences.getString("ssid", "");
+  savedPASS = preferences.getString("pass", "");
+  preferences.end();
+  return savedSSID.length() > 0;
+}
+
+bool connectToWiFi() {
+  if (loadWiFiCredentials()) {
+    WiFi.mode(WIFI_STA); // Explicitly set station mode
+    WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+
+    Serial.print("Connecting to WiFi");
+    unsigned long startAttemptTime = millis();
+
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 30000) { // 30 sec timeout
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("Connected!");
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      return true;
+    } else {
+      Serial.println("Failed to connect. Restarting AP mode.");
+      return false; // Let setup() call startAPMode()
+    }
+  }
+  return false;
+}
+
+// ===== Modes =====
+void startAPMode() {
+  WiFi.softAP("MixerGrinder_Setup", "12345678");
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", wifiSetupHTML);
+  });
+  server.on("/savewifi", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if(request->hasParam("ssid", true) && request->hasParam("pass", true)) {
+      saveWiFiCredentials(request->getParam("ssid", true)->value(),
+                         request->getParam("pass", true)->value());
+      request->send(200, "text/plain", "Saved! Rebooting...");
+      delay(500);
+      ESP.restart();
+    }
+  });
+  server.begin();
+}
+
+void setupAPIRoutes() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", indexHTML);
+  });
+
+  ws.onEvent([](AsyncWebSocket *, AsyncWebSocketClient *, AwsEventType type,
+                void *, uint8_t *data, size_t len) {
+    if (type == WS_EVT_DATA) {
+      String msg((char*)data, len);
+      StaticJsonDocument<256> doc;
+      if (!deserializeJson(doc, msg)) {
+        if (doc.containsKey("motorSpeed")) setMotorSpeed(doc["motorSpeed"]);
+        if (doc.containsKey("uvOn")) setUV(doc["uvOn"]);
+      }
+    }
+  });
+  server.addHandler(&ws);
+
+  server.on("/api/power", HTTP_GET, [](AsyncWebServerRequest *req){
+    req->send(200, "application/json", getPowerDataJSON());
+  });
+
+  server.on("/api/recipes", HTTP_GET, [](AsyncWebServerRequest *req){
+    req->send(200, "application/json", recipesJSON);
+  });
+
+  server.on("/api/recipes", HTTP_POST, [](AsyncWebServerRequest *req){
+    if(req->hasParam("plain", true)) {
+      String body = req->getParam("plain", true)->value();
+      StaticJsonDocument<2048> doc;
+      if (!deserializeJson(doc, body)) {
+        recipesJSON = body;
+        saveRecipesToFlash();
+        req->send(200, "text/plain", "Saved");
+      } else req->send(400, "text/plain", "Invalid JSON");
+    }
+  });
+
+  server.on("/api/runrecipe", HTTP_POST, [](AsyncWebServerRequest *req){
+    if(req->hasParam("plain", true)) {
+      String body = req->getParam("plain", true)->value();
+      StaticJsonDocument<512> doc;
+      if (!deserializeJson(doc, body) && doc.containsKey("speed") && doc.containsKey("time")) {
+        setMotorSpeed(doc["speed"]);
+        recipeEndTime = millis() + (doc["time"].as<unsigned long>() * 1000UL);
+        recipeRunning = true;
+        req->send(200, "text/plain", "Running recipe");
+      } else req->send(400, "text/plain", "Invalid JSON");
+    }
+  });
+
+  server.on("/api/public", HTTP_GET, [](AsyncWebServerRequest *req){
+    // Stub, empty for now
+    req->send(200, "application/json", "[]");
+  });
+
+  server.begin();
+}
+
+// ===== WebSocket notify =====
+void notifyClients() {
+  if(ws.count()>0){
+    ws.textAll(getPowerDataJSON());
+  }
+}
+
+// ===== Setup & Loop =====
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(UV_PIN, OUTPUT);
+  setUV(false);
+
+  setupPWM();
+  setMotorSpeed(0);
+
+  analogSetPinAttenuation(V1, ADC_11db);
+  analogSetPinAttenuation(I1, ADC_11db);
+  emon1.voltage(V1, CV1, 1.732);
+  emon1.current(I1, CI1);
+
+  loadRecipesFromFlash();
+
+  if(connectToWiFi()){
+    isSTA = true;
+    setupAPIRoutes();
+  } else {
+    isSTA = false;
+    startAPMode();
+  }
+}
+
+void loop() {
+  if(isSTA){
+    static unsigned long lastNotify = 0;
+    unsigned long now = millis();
+    if(now-lastNotify > 2000){
+      notifyClients();
+      lastNotify = now;
+    }
+    // Stop the motor when recipe time expires
+    if(recipeRunning && now >= recipeEndTime){
+      setMotorSpeed(0);
+      recipeRunning = false;
+    }
+  }
+}
