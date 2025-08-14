@@ -365,12 +365,27 @@ bool loadWiFiCredentials() {
 
 bool connectToWiFi() {
   if (loadWiFiCredentials()) {
+    WiFi.mode(WIFI_STA); // Explicitly set station mode
     WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
-    unsigned long startTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
+
+    Serial.print("Connecting to WiFi");
+    unsigned long startAttemptTime = millis();
+
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 30000) { // 30 sec timeout
       delay(500);
+      Serial.print(".");
     }
-    return WiFi.status() == WL_CONNECTED;
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("Connected!");
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      return true;
+    } else {
+      Serial.println("Failed to connect. Restarting AP mode.");
+      return false; // Let setup() call startAPMode()
+    }
   }
   return false;
 }
