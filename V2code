@@ -1,62 +1,64 @@
-// =======================
-// Embedded Web Pages
-// =======================
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <ArduinoJson.h>
+#include "EmonLib.h"
+#include <Preferences.h>
+#include "driver/ledc.h"
 
-// WiFi setup HTML page
+// ================== EMBEDDED WEB UI ==================
+// WiFi setup page
 const char wifiSetupHTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
+<!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WiFi Setup - Mixer Grinder</title>
 <style>
-body { font-family: Arial, sans-serif; background-color: #f8f8f8; }
-.container { max-width: 350px; margin: auto; margin-top: 40px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 0 5px rgba(0,0,0,0.1); }
-input { width: 100%; padding: 10px; margin: 6px 0; box-sizing: border-box; }
-button { padding: 10px; background: #4CAF50; border: none; color: white; width: 100%; border-radius: 4px; font-size: 16px; }
-h2 { text-align: center; }
+body{font-family:Arial,sans-serif;background:#f8f8f8;}
+.container{max-width:350px;margin:auto;margin-top:40px;background:#fff;padding:20px;border-radius:8px;box-shadow:0 0 5px rgba(0,0,0,0.1);}
+input{width:100%;padding:10px;margin:6px 0;box-sizing:border-box;}
+button{padding:10px;background:#4CAF50;border:none;color:#fff;width:100%;border-radius:4px;font-size:16px;}
+h2{text-align:center;}
 </style>
-</head>
-<body>
+</head><body>
 <div class="container">
-  <h2>WiFi Setup</h2>
-  <form action="/savewifi" method="POST">
-    <input type="text" name="ssid" placeholder="WiFi SSID" required>
-    <input type="password" name="pass" placeholder="Password" required>
-    <button type="submit">Save & Connect</button>
-  </form>
+<h2>WiFi Setup</h2>
+<form action="/savewifi" method="POST">
+<input type="text" name="ssid" placeholder="WiFi SSID" required>
+<input type="password" name="pass" placeholder="Password" required>
+<button type="submit">Save & Connect</button>
+</form>
 </div>
-</body>
-</html>
+</body></html>
 )rawliteral";
 
-// Main control dashboard page
+// Main UI page with Run buttons
 const char indexHTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
+<!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Smart Mixer Grinder</title>
 <style>
-body { font-family: Arial, sans-serif; background: #f0f2f5; margin: 0; }
-header { background: #4CAF50; color: white; padding: 15px; font-size: 20px; text-align: center; }
-.menu { background: #333; overflow: hidden; display: flex; }
-.menu button { flex: 1; padding: 14px; background: #333; color: white; border: none; font-size: 16px; }
-.menu button:hover { background: #111; }
-.section { display: none; padding: 20px; }
-.active { display: block; }
-h2 { margin-top: 0; }
-.card { background: white; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-label { display: block; margin-top: 10px; }
-input, select { width: 100%; padding: 8px; box-sizing: border-box; margin-top: 6px; }
-button.action { margin-top: 10px; padding: 10px; background: #4CAF50; color: white; border: none; border-radius: 4px; }
-.toggle { display: flex; align-items: center; margin-top: 8px; }
-.toggle input { margin-left: 10px; }
-.stats { font-size: 16px; line-height: 1.5; }
-.recipe { border: 1px solid #ddd; padding: 10px; border-radius: 5px; margin-bottom: 10px; background: #fafafa; }
+body{font-family:Arial,sans-serif;background:#f0f2f5;margin:0;}
+header{background:#4CAF50;color:#fff;padding:15px;font-size:20px;text-align:center;}
+.menu{background:#333;overflow:hidden;display:flex;}
+.menu button{flex:1;padding:14px;background:#333;color:#fff;border:none;font-size:16px;cursor:pointer;}
+.menu button:hover{background:#111;}
+.section{display:none;padding:20px;}
+.active{display:block;}
+h2{margin-top:0;}
+.card{background:#fff;padding:15px;border-radius:8px;margin-bottom:15px;box-shadow:0 1px 3px rgba(0,0,0,0.1);}
+label{display:block;margin-top:10px;}
+input,select,textarea{width:100%;padding:8px;box-sizing:border-box;margin-top:6px;}
+button.action{margin-top:10px;padding:10px;background:#4CAF50;color:#fff;border:none;border-radius:4px;cursor:pointer;}
+.toggle{display:flex;align-items:center;margin-top:8px;}
+.toggle input{margin-left:10px;}
+.stats{font-size:16px;line-height:1.5;}
+.recipe{border:1px solid #ddd;padding:10px;border-radius:5px;margin-bottom:10px;background:#fafafa;}
+.recipe-details{margin-top:10px;display:none;}
+.recipe:hover .recipe-details{display:block;}
+.recipe button.run-button{margin-top:10px;padding:6px 12px;background:#007bff;color:#fff;border:none;border-radius:4px;cursor:pointer;}
 </style>
-</head>
-<body>
+</head><body>
 <header>Smart Mixer Grinder</header>
 <div class="menu">
   <button onclick="showSection('home')">Home</button>
@@ -80,7 +82,8 @@ button.action { margin-top: 10px; padding: 10px; background: #4CAF50; color: whi
     <h2>Power Stats</h2>
     Voltage: <span id="voltage">--</span> V<br>
     Current: <span id="current">--</span> A<br>
-    Power: <span id="power">--</span> W
+    Power: <span id="power">--</span> W<br>
+    Recipe Running: <span id="recipeStatus">No</span>
   </div>
 </div>
 
@@ -91,9 +94,9 @@ button.action { margin-top: 10px; padding: 10px; background: #4CAF50; color: whi
     <textarea id="ingredients" placeholder="Ingredients (name,weight,calories per line)"></textarea>
     <input type="number" id="servingSize" placeholder="Serving Size">
     <select id="recipeMotorSpeed">
-      <option value="1">Level 1</option>
-      <option value="2">Level 2</option>
-      <option value="3">Level 3</option>
+      <option value="1">Level 1 (30%)</option>
+      <option value="2">Level 2 (60%)</option>
+      <option value="3">Level 3 (100%)</option>
     </select>
     <input type="number" id="recipeTime" placeholder="Run Time (seconds)">
     <button class="action" onclick="saveRecipe()">Save Recipe</button>
@@ -110,7 +113,7 @@ button.action { margin-top: 10px; padding: 10px; background: #4CAF50; color: whi
 </div>
 
 <script>
-var ws;
+let ws;
 
 function initWebSocket() {
   ws = new WebSocket('ws://' + window.location.host + '/ws');
@@ -121,6 +124,7 @@ function initWebSocket() {
     document.getElementById("power").innerText = data.power.toFixed(2);
     document.getElementById("motorSpeed").value = data.motorSpeed;
     document.getElementById("uvToggle").checked = data.uvOn;
+    document.getElementById("recipeStatus").innerText = data.running ? 'Yes' : 'No';
   };
 }
 
@@ -140,45 +144,87 @@ function updateUV() {
 }
 
 function saveRecipe() {
-  let name = document.getElementById('recipeName').value;
-  let ing = document.getElementById('ingredients').value.trim().split("\\n").map(line => {
-    let p = line.split(',');
-    return { name: p[0], weight: p[1], calories: p[2] };
+  let name = document.getElementById('recipeName').value.trim();
+  if (!name) { alert("Please enter a Recipe Name"); return; }
+  let ingLines = document.getElementById('ingredients').value.trim().split("\n");
+  let ingredients = ingLines.map(line => {
+    let p = line.split(",");
+    return { name: p[0].trim(), weight: p[1].trim(), calories: p[2].trim() };
   });
   let serving = parseInt(document.getElementById('servingSize').value);
   let speed = parseInt(document.getElementById('recipeMotorSpeed').value);
   let time = parseInt(document.getElementById('recipeTime').value);
 
   fetch('/api/recipes').then(r => r.json()).then(recipes => {
-    recipes.push({ name, ingredients: ing, serving, speed, time });
-    return fetch('/api/recipes', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(recipes) });
-  }).then(() => loadRecipes());
+    recipes.push({ name, ingredients, serving, speed, time });
+    return fetch('/api/recipes', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(recipes)
+    });
+  }).then(() => {
+    loadRecipes();
+    alert("Recipe saved!");
+  }).catch(e => alert("Error saving recipe: " + e));
 }
 
 function loadRecipes() {
-  fetch('/api/recipes').then(r => r.json()).then(data => {
+  fetch('/api/recipes').then(r => r.json()).then(recipes => {
     let html = '';
-    data.forEach((r,i) => {
-      let totalCal = r.ingredients.reduce((a,b)=>a+parseFloat(b.calories), 0);
-      html += `<div class="recipe"><b>${r.name}</b> - ${totalCal} Cal<br><button onclick="deleteRecipe(${i})">Delete</button></div>`;
+    recipes.forEach((r,i) => {
+      let totalCal = r.ingredients.reduce((a,b) => a + parseFloat(b.calories || 0), 0);
+      html += `<div class="recipe">
+        <b>${r.name}</b> - ${totalCal.toFixed(1)} Cal 
+        <br><button onclick="runRecipe(${i})" class="run-button">Run</button>
+        <button onclick="deleteRecipe(${i})" style="margin-left:5px;background:#dc3545;">Delete</button>
+        <div class="recipe-details">
+          Serving Size: ${r.serving}<br>
+          Speed Level: ${r.speed}<br>
+          Run Time: ${r.time} seconds<br>
+          Ingredients:<br>`;
+      r.ingredients.forEach(ing => {
+        html += `- ${ing.name} ${ing.weight}g, ${ing.calories} Cal<br>`;
+      });
+      html += '</div></div>';
     });
     document.getElementById('recipeList').innerHTML = html;
   });
 }
 
 function deleteRecipe(index) {
-  fetch('/api/recipes').then(r => r.json()).then(data => {
-    data.splice(index,1);
-    return fetch('/api/recipes', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
+  fetch('/api/recipes').then(r => r.json()).then(recipes => {
+    recipes.splice(index, 1);
+    return fetch('/api/recipes', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(recipes)
+    });
   }).then(() => loadRecipes());
+}
+
+function runRecipe(index) {
+  fetch('/api/recipes').then(r => r.json()).then(recipes => {
+    if (index >= 0 && index < recipes.length) {
+      let r = recipes[index];
+      fetch('/api/runrecipe', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({speed: r.speed, time: r.time})
+      }).then(() => alert("Recipe started! Motor will run for " + r.time + " seconds."));
+    }
+  });
 }
 
 function loadPublicRecipes() {
   fetch('/api/public').then(r => r.json()).then(data => {
+    if (!Array.isArray(data)) data = [];
     let html = '';
     data.forEach(r => {
-      let totalCal = r.ingredients.reduce((a,b)=>a+parseFloat(b.calories), 0);
-      html += `<div class="recipe"><b>${r.name}</b> - ${totalCal} Cal<br><button onclick='importRecipe(${JSON.stringify(r)})'>Import</button></div>`;
+      let totalCal = r.ingredients.reduce((a,b) => a + parseFloat(b.calories || 0), 0);
+      html += `<div class="recipe">
+        <b>${r.name}</b> - ${totalCal.toFixed(1)} Cal 
+        <br><button onclick='importRecipe(${JSON.stringify(r)})' class="run-button">Import</button>
+      </div>`;
     });
     document.getElementById('publicList').innerHTML = html;
   });
@@ -187,7 +233,11 @@ function loadPublicRecipes() {
 function importRecipe(recipe) {
   fetch('/api/recipes').then(r => r.json()).then(recipes => {
     recipes.push(recipe);
-    return fetch('/api/recipes', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(recipes) });
+    return fetch('/api/recipes', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(recipes)
+    });
   }).then(() => alert("Imported!"));
 }
 
@@ -196,94 +246,108 @@ window.onload = function() {
   loadRecipes();
 }
 </script>
-</body>
-</html>
+</body></html>
 )rawliteral";
 
-
-#include <WiFi.h>
-#include <ESPAsyncWebServer.h>
-#include <AsyncTCP.h>
-#include <ArduinoJson.h>
-#include "EmonLib.h"
-#include <Preferences.h>
-
-// Motor & UV pin definitions
+// ================== PINS & SETTINGS ==================
 #define MOTOR_PIN 25
 #define UV_PIN 26
 
-// Motor PWM configuration
-#define PWM_CHANNEL 0
 #define PWM_FREQ 5000
 #define PWM_RES 8
 
-// Voltage and current sensor pins
 #define V1 34
 #define I1 35
 #define CV1 1000
 #define CI1 1000
 
-// Include Preferences for storing WiFi info
 Preferences preferences;
-
-// Web server and WebSocket server on port 80
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
-
-// Energy monitoring object
 EnergyMonitor emon1;
 
-// Stores if ESP32 connected as station
 bool isSTA = false;
 
-String savedSSID;
-String savedPass;
-
-// Runtime motor speed state (0-3)
-uint8_t motorSpeedLevel = 0;  // 0=off,1=30%,2=60%,3=100%
-
-// UV LED state
+uint8_t motorSpeedLevel = 0;
 bool uvOn = false;
-
-// In-memory recipe storage (JSON string)
 String recipesJSON = "[]";
 
-// --- Utility functions ---
+bool recipeRunning = false;
+unsigned long recipeEndTime = 0;
 
-// Set PWM duty from motor speed level
-void setMotorSpeed(uint8_t level) {
-  uint8_t duty = 0;
-  if (level == 1) duty = 76;  // 30% of 255
-  else if (level == 2) duty = 153; // 60%
-  else if (level == 3) duty = 255;  // 100%
-  motorSpeedLevel = level;
-  ledcWrite(PWM_CHANNEL, duty);
+ledc_timer_config_t ledc_timer;
+ledc_channel_config_t ledc_channel;
+
+// ================== FUNCTIONS ==================
+void setupPWM() {
+  ledc_timer.speed_mode = LEDC_HIGH_SPEED_MODE;
+  ledc_timer.timer_num = LEDC_TIMER_0;
+  ledc_timer.duty_resolution = (ledc_timer_bit_t)PWM_RES;
+  ledc_timer.freq_hz = PWM_FREQ;
+  ledc_timer.clk_cfg = LEDC_AUTO_CLK;
+  ledc_timer_config(&ledc_timer);
+
+  ledc_channel.speed_mode = LEDC_HIGH_SPEED_MODE;
+  ledc_channel.channel = LEDC_CHANNEL_0;
+  ledc_channel.timer_sel = LEDC_TIMER_0;
+  ledc_channel.intr_type = LEDC_INTR_DISABLE;
+  ledc_channel.gpio_num = MOTOR_PIN;
+  ledc_channel.duty = 0;
+  ledc_channel.hpoint = 0;
+  ledc_channel_config(&ledc_channel);
 }
 
-// Set UV LED GPIO
+void setPWMDuty(uint8_t duty) {
+  ledc_set_duty(ledc_channel.speed_mode, ledc_channel.channel, duty);
+  ledc_update_duty(ledc_channel.speed_mode, ledc_channel.channel);
+}
+
+void setMotorSpeed(uint8_t level) {
+  uint8_t duty = 0;
+  if (level == 1) duty = 76;
+  else if (level == 2) duty = 153;
+  else if (level == 3) duty = 255;
+  motorSpeedLevel = level;
+  setPWMDuty(duty);
+}
+
 void setUV(bool on) {
   uvOn = on;
   digitalWrite(UV_PIN, uvOn ? HIGH : LOW);
 }
 
-// Read power data, return JSON string
 String getPowerDataJSON() {
   emon1.calcVI(20, 2000);
   float voltage = emon1.Vrms;
   float current = emon1.Irms;
   float power = voltage * current;
-  StaticJsonDocument<200> doc;
+  StaticJsonDocument<256> doc;
   doc["voltage"] = voltage;
   doc["current"] = current;
   doc["power"] = power;
   doc["motorSpeed"] = motorSpeedLevel;
   doc["uvOn"] = uvOn;
+  doc["running"] = recipeRunning;
   String out;
   serializeJson(doc, out);
   return out;
 }
 
-// Save WiFi credentials in preferences
+void saveRecipesToFlash() {
+  preferences.begin("recipes", false);
+  preferences.putString("data", recipesJSON);
+  preferences.end();
+}
+
+void loadRecipesFromFlash() {
+  preferences.begin("recipes", true);
+  recipesJSON = preferences.getString("data", "[]");
+  preferences.end();
+}
+
+// ===== WiFi =====
+String savedSSID, savedPASS;
+
 void saveWiFiCredentials(String ssid, String pass) {
   preferences.begin("wifi", false);
   preferences.putString("ssid", ssid);
@@ -291,173 +355,148 @@ void saveWiFiCredentials(String ssid, String pass) {
   preferences.end();
 }
 
-// Load WiFi credentials from preferences
 bool loadWiFiCredentials() {
   preferences.begin("wifi", true);
   savedSSID = preferences.getString("ssid", "");
-  savedPass = preferences.getString("pass", "");
+  savedPASS = preferences.getString("pass", "");
   preferences.end();
   return savedSSID.length() > 0;
 }
 
-// Connect to WiFi as station
 bool connectToWiFi() {
   if (loadWiFiCredentials()) {
-    WiFi.begin(savedSSID.c_str(), savedPass.c_str());
-    Serial.print("Connecting to WiFi");
+    WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
     unsigned long startTime = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
-      Serial.print(".");
       delay(500);
     }
-    Serial.println();
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("Connected to WiFi!");
-      Serial.print("IP: ");
-      Serial.println(WiFi.localIP());
-      return true;
-    }
+    return WiFi.status() == WL_CONNECTED;
   }
   return false;
 }
 
-// Start Access Point mode with captive portal
+// ===== Modes =====
 void startAPMode() {
   WiFi.softAP("MixerGrinder_Setup", "12345678");
-  Serial.println("Started AP Mode: MixerGrinder_Setup");
-  
-  // Serve WiFi setup page on root "/"
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", wifiSetupHTML);
   });
-
-  // Handle WiFi credentials submission
   server.on("/savewifi", HTTP_POST, [](AsyncWebServerRequest *request) {
     if(request->hasParam("ssid", true) && request->hasParam("pass", true)) {
-      String newSSID = request->getParam("ssid", true)->value();
-      String newPass = request->getParam("pass", true)->value();
-      saveWiFiCredentials(newSSID, newPass);
-      request->send(200, "text/plain", "Saved WiFi settings. Rebooting...");
-      delay(1000);
+      saveWiFiCredentials(request->getParam("ssid", true)->value(),
+                         request->getParam("pass", true)->value());
+      request->send(200, "text/plain", "Saved! Rebooting...");
+      delay(500);
       ESP.restart();
-    } else {
-      request->send(400, "text/plain", "Missing SSID or Password");
     }
   });
-  
   server.begin();
 }
 
-// Handle embedded web pages & APIs in Station mode
 void setupAPIRoutes() {
-  // Serve main UI page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "text/html", indexHTML);
   });
 
-  // WebSocket event handler
-  ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
-    if (type == WS_EVT_CONNECT) {
-      Serial.println("Client connected to WebSocket");
-    } else if (type == WS_EVT_DISCONNECT) {
-      Serial.println("Client disconnected from WebSocket");
-    } else if (type == WS_EVT_DATA) {
-      String msg = String((char*)data).substring(0, len);
+  ws.onEvent([](AsyncWebSocket *, AsyncWebSocketClient *, AwsEventType type,
+                void *, uint8_t *data, size_t len) {
+    if (type == WS_EVT_DATA) {
+      String msg((char*)data, len);
       StaticJsonDocument<256> doc;
-      DeserializationError error = deserializeJson(doc, msg);
-      if(!error) {
-        if (doc.containsKey("motorSpeed")) {
-          setMotorSpeed(doc["motorSpeed"]);
-        }
-        if (doc.containsKey("uvOn")) {
-          setUV(doc["uvOn"]);
-        }
+      if (!deserializeJson(doc, msg)) {
+        if (doc.containsKey("motorSpeed")) setMotorSpeed(doc["motorSpeed"]);
+        if (doc.containsKey("uvOn")) setUV(doc["uvOn"]);
       }
     }
   });
   server.addHandler(&ws);
 
-  // API: Return power data
   server.on("/api/power", HTTP_GET, [](AsyncWebServerRequest *req){
     req->send(200, "application/json", getPowerDataJSON());
   });
 
-  // API: Get all saved recipes
   server.on("/api/recipes", HTTP_GET, [](AsyncWebServerRequest *req){
     req->send(200, "application/json", recipesJSON);
   });
 
-  // API: Save recipes (overwrite all)
   server.on("/api/recipes", HTTP_POST, [](AsyncWebServerRequest *req){
     if(req->hasParam("plain", true)) {
       String body = req->getParam("plain", true)->value();
-      StaticJsonDocument<1024> doc;
-      if(deserializeJson(doc, body) == DeserializationError::Ok) {
+      StaticJsonDocument<2048> doc;
+      if (!deserializeJson(doc, body)) {
         recipesJSON = body;
-        req->send(200, "text/plain", "Recipes saved");
-      } else {
-        req->send(400, "text/plain", "Invalid JSON");
-      }
-    } else {
-      req->send(400, "text/plain", "Missing JSON body");
+        saveRecipesToFlash();
+        req->send(200, "text/plain", "Saved");
+      } else req->send(400, "text/plain", "Invalid JSON");
     }
   });
 
-  // API: Fetch Public Recipes from mock URL (example, not implemented here)
+  server.on("/api/runrecipe", HTTP_POST, [](AsyncWebServerRequest *req){
+    if(req->hasParam("plain", true)) {
+      String body = req->getParam("plain", true)->value();
+      StaticJsonDocument<512> doc;
+      if (!deserializeJson(doc, body) && doc.containsKey("speed") && doc.containsKey("time")) {
+        setMotorSpeed(doc["speed"]);
+        recipeEndTime = millis() + (doc["time"].as<unsigned long>() * 1000UL);
+        recipeRunning = true;
+        req->send(200, "text/plain", "Running recipe");
+      } else req->send(400, "text/plain", "Invalid JSON");
+    }
+  });
+
   server.on("/api/public", HTTP_GET, [](AsyncWebServerRequest *req){
-    // Just respond with empty array for now, UI will fetch real API online
+    // Stub, empty for now
     req->send(200, "application/json", "[]");
   });
 
   server.begin();
 }
 
-// Update real-time stats every few seconds via WebSocket broadcast
-void notifyClientsPower() {
-  if (ws.count() > 0) {
+// ===== WebSocket notify =====
+void notifyClients() {
+  if(ws.count()>0){
     ws.textAll(getPowerDataJSON());
   }
 }
 
+// ===== Setup & Loop =====
 void setup() {
   Serial.begin(115200);
-  delay(1000);
 
-  // Motor and UV GPIO setup
   pinMode(UV_PIN, OUTPUT);
-  digitalWrite(UV_PIN, LOW);
-  
-  ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RES);
-  ledcAttachPin(MOTOR_PIN, PWM_CHANNEL);
-  setMotorSpeed(0);  // motor off initially
+  setUV(false);
 
-  // Sensor setup
+  setupPWM();
+  setMotorSpeed(0);
+
   analogSetPinAttenuation(V1, ADC_11db);
   analogSetPinAttenuation(I1, ADC_11db);
   emon1.voltage(V1, CV1, 1.732);
   emon1.current(I1, CI1);
 
-  // Initialize Preferences
-  preferences.begin("wifi", false);
+  loadRecipesFromFlash();
 
-  if (connectToWiFi()) {
+  if(connectToWiFi()){
     isSTA = true;
-    Serial.println("Running in Station mode");
     setupAPIRoutes();
   } else {
     isSTA = false;
-    Serial.println("Running in AP mode");
     startAPMode();
   }
 }
 
 void loop() {
-  if (isSTA) {
+  if(isSTA){
     static unsigned long lastNotify = 0;
-    if (millis() - lastNotify > 2000) {
-      notifyClientsPower();
-      lastNotify = millis();
+    unsigned long now = millis();
+    if(now-lastNotify > 2000){
+      notifyClients();
+      lastNotify = now;
+    }
+    // Stop the motor when recipe time expires
+    if(recipeRunning && now >= recipeEndTime){
+      setMotorSpeed(0);
+      recipeRunning = false;
     }
   }
-  // AsyncWebServer handles clients asynchronously
 }
