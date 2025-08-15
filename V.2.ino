@@ -35,7 +35,7 @@ h2{text-align:center;}
 )rawliteral";
 
 // ================== MAIN DASHBOARD PAGE ==================
-// The main HTML now references an external script at /app.js to avoid inline parsing issues
+// The main HTML references an external script at /app.js to avoid inline parsing issues
 const char indexHTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -351,8 +351,13 @@ const char indexHTML[] PROGMEM = R"rawliteral(
 
 // ================== CLIENT JS (served at /app.js) ==================
 const char appJS[] PROGMEM = R"rawliteral(
-/* All JS avoids template literals/backticks to prevent accidental unclosed backtick errors.
-   This file intentionally uses string concatenation and createElement APIs. */
+/* Client JS purposely avoids template literals/backticks.
+   Improvements:
+   - After saving a recipe, the form resets and the newly saved recipe is shown.
+   - Each recipe card shows bold name, serving size and total calories.
+   - Run/Delete/Upload buttons are wired to their functions.
+   - Clicking a recipe toggles its details dropdown.
+*/
 
 var ws;
 var publicRecipes = [];
@@ -472,9 +477,22 @@ function addIngredientRow() {
   container.appendChild(row);
 }
 
+function resetRecipeForm() {
+  document.getElementById('recipeName').value = '';
+  document.getElementById('servingSize').value = '';
+  document.getElementById('recipeMotorSpeed').value = '1';
+  document.getElementById('recipeTime').value = '';
+  var container = document.getElementById('ingredientList');
+  container.innerHTML = '';
+  // add a fresh blank row
+  container.appendChild(createIngredientRow());
+}
+
 function saveRecipe() {
+  var btn = document.getElementById('saveRecipeBtn');
+  if (btn) btn.disabled = true;
   var name = document.getElementById('recipeName').value.trim();
-  if (!name) { alert('Please enter a Recipe Name'); return; }
+  if (!name) { alert('Please enter a Recipe Name'); if (btn) btn.disabled = false; return; }
   var names = document.querySelectorAll('.ingredientName');
   var weights = document.querySelectorAll('.ingredientWeight');
   var calories = document.querySelectorAll('.ingredientCalories');
@@ -492,17 +510,41 @@ function saveRecipe() {
   var time = parseInt(document.getElementById('recipeTime').value) || 0;
   fetch('/api/recipes').then(function(r){ return r.json(); }).then(function(recipes){
     if (!Array.isArray(recipes)) recipes = [];
-    recipes.push({ name: name, ingredients: ingredients, serving: serving, speed: speed, time: time });
+    var newRecipe = { name: name, ingredients: ingredients, serving: serving, speed: speed, time: time };
+    recipes.push(newRecipe);
     return fetch('/api/recipes', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify(recipes)
+    }).then(function(resp){
+      if (!resp.ok) throw new Error('Save failed');
+      // After save success, reload recipes and reset the form. Highlight the new one.
+      resetRecipeForm();
+      loadRecipes(function(){ highlightSavedRecipe(newRecipe.name); });
+      alert('Recipe saved!');
     });
-  }).then(function(){ loadRecipes(); alert('Recipe saved!'); })
-    .catch(function(e){ alert('Error saving recipe: ' + e); });
+  }).catch(function(e){ alert('Error saving recipe: ' + e); })
+    .finally(function(){ if (btn) btn.disabled = false; });
 }
 
-function loadRecipes() {
+function highlightSavedRecipe(name) {
+  // Try to find the first recipe card whose header matches the name and briefly change bg
+  if (!name) return;
+  var headers = document.querySelectorAll('.recipe .recipe-header b');
+  for (var i = 0; i < headers.length; i++) {
+    if (headers[i].innerText === name) {
+      var card = headers[i].closest('.recipe');
+      if (card) {
+        card.style.transition = 'box-shadow 0.2s ease, transform 0.2s ease';
+        card.style.transform = 'scale(1.01)';
+        setTimeout(function(){ card.style.transform = ''; }, 300);
+      }
+      break;
+    }
+  }
+}
+
+function loadRecipes(cb) {
   fetch('/api/recipes').then(function(r){ return r.json(); }).then(function(recipes){
     if (!Array.isArray(recipes)) recipes = [];
     var html = '';
@@ -537,15 +579,24 @@ function loadRecipes() {
     }
     document.getElementById('recipeList').innerHTML = html;
 
+    // Attach handlers
     var recEls = document.querySelectorAll('.recipe');
     for (var m = 0; m < recEls.length; m++) {
       (function(el){
         el.addEventListener('click', function(){
           var idx = el.getAttribute('data-index');
           var details = document.getElementById('details-' + idx);
+          if (!details) return;
           var isShown = details.style.display === 'block';
           details.style.display = isShown ? 'none' : 'block';
           el.setAttribute('aria-expanded', !isShown);
+        });
+        // keyboard accessibility: Enter toggles
+        el.addEventListener('keydown', function(e){
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            el.click();
+          }
         });
       })(recEls[m]);
     }
@@ -583,9 +634,11 @@ function loadRecipes() {
       })(upBtns[q]);
     }
 
+    if (typeof cb === 'function') cb();
   }).catch(function(err){
     console.error('Failed to load recipes', err);
     document.getElementById('recipeList').innerHTML = '<div class=\"card\">No recipes or failed to load.</div>';
+    if (typeof cb === 'function') cb();
   });
 }
 
@@ -605,6 +658,7 @@ function uploadPublicRecipe(index) {
 }
 
 function deleteRecipe(index) {
+  if (!confirm('Delete this recipe?')) return;
   fetch('/api/recipes').then(function(r){ return r.json(); }).then(function(recipes){
     if (!Array.isArray(recipes)) recipes = [];
     recipes.splice(index, 1);
@@ -868,8 +922,6 @@ void setupAPIRoutes() {
 
   // serve a small blank favicon so browser won't 404 repeatedly
   server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest *request){
-    // Return a 1x1 transparent favicon (data URI not directly usable here),
-    // so just respond 204 No Content to silence logs/404s.
     request->send(204, "image/x-icon", "");
   });
 
@@ -903,6 +955,19 @@ void setupAPIRoutes() {
         saveRecipesToFlash();
         req->send(200, "text/plain", "Saved");
       } else req->send(400, "text/plain", "Invalid JSON");
+    } else {
+      // If body is not available via plain param, try reading the body differently:
+      if (req->hasArg("plain")) {
+        String body = req->arg("plain");
+        StaticJsonDocument<2048> doc;
+        if (!deserializeJson(doc, body)) {
+          recipesJSON = body;
+          saveRecipesToFlash();
+          req->send(200, "text/plain", "Saved");
+          return;
+        }
+      }
+      req->send(400, "text/plain", "Invalid JSON or missing body");
     }
   });
 
@@ -916,6 +981,8 @@ void setupAPIRoutes() {
         recipeRunning = true;
         req->send(200, "text/plain", "Running recipe");
       } else req->send(400, "text/plain", "Invalid JSON");
+    } else {
+      req->send(400, "text/plain", "Missing body");
     }
   });
 
