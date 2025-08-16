@@ -21,19 +21,46 @@ input{width:100%;padding:10px;margin:6px 0;box-sizing:border-box;}
 button{padding:10px;background:#4CAF50;border:none;color:#fff;width:100%;
 border-radius:4px;font-size:16px;}
 h2{text-align:center;}
+ul{list-style:none;padding:0;margin-top:10px;}
+li{padding:8px;cursor:pointer;border-bottom:1px solid #eee;}
+li:hover{background:#e1ecff;}
 </style>
 </head><body>
 <div class="container">
 <h2>WiFi Setup</h2>
-<form action="/savewifi" method="POST">
-<input type="text" name="ssid" placeholder="WiFi SSID" required>
-<input type="password" name="pass" placeholder="Password" required>
-<button type="submit">Save & Connect</button>
+
+<form action="/savewifi" method="POST" id="wifiForm">
+  <input type="text" name="ssid" id="ssidField" placeholder="WiFi SSID" required readonly>
+  <input type="password" name="pass" id="passField" placeholder="Password" required>
+  <button type="submit">Save & Connect</button>
 </form>
+
+<button type="button" id="scanWifiBtn" style="margin-top:15px;width:100%;">Scan for WiFi</button>
+<ul id="wifiList"></ul>
+
 </div>
+<script>
+document.getElementById('scanWifiBtn').addEventListener('click', function(){
+  fetch('/scanwifi')
+    .then(r => r.json())
+    .then(ssids => {
+      var list = document.getElementById('wifiList');
+      list.innerHTML = '';
+      ssids.forEach(function(ssid) {
+        var li = document.createElement('li');
+        li.innerText = ssid;
+        li.onclick = function() {
+          document.getElementById('ssidField').value = ssid;
+          document.getElementById('ssidField').readOnly = true;
+          document.getElementById('passField').focus();
+        };
+        list.appendChild(li);
+      });
+    });
+});
+</script>
 </body></html>
 )rawliteral";
-
 // ================== MAIN DASHBOARD PAGE ==================
 // The main HTML references an external script at /app.js to avoid inline parsing issues
 const char indexHTML[] PROGMEM = R"rawliteral(
@@ -283,6 +310,7 @@ const char indexHTML[] PROGMEM = R"rawliteral(
   <button class="active" id="tab-home" data-target="home" role="tab" aria-selected="true" aria-controls="home">Home</button>
   <button id="tab-myrecipes" data-target="myrecipes" role="tab" aria-selected="false" aria-controls="myrecipes">My Recipes</button>
   <button id="tab-publicrecipes" data-target="publicrecipes" role="tab" aria-selected="false" aria-controls="publicrecipes">Public Recipes</button>
+  <button id="tab-wifi" data-target="wifi" role="tab" aria-selected="false" aria-controls="wifi">WiFi Settings</button>
 </div>
 
 <main>
@@ -340,6 +368,19 @@ const char indexHTML[] PROGMEM = R"rawliteral(
       <div id="publicList" aria-live="polite" aria-atomic="true"></div>
     </div>
   </section>
+  <section id="wifi" class="section" role="tabpanel" tabindex="0" aria-hidden="true">
+  <div class="card" aria-label="WiFi Settings">
+    <h2>WiFi Settings</h2>
+    <button class="action" id="wifiScanBtn">Scan for WiFi</button>
+    <ul id="wifiScanList" style="list-style:none;padding:0;margin-top:10px;"></ul>
+    <hr>
+    <div>
+      <b>Forget WiFi:</b>
+      <button class="delete-button" id="forgetWifiBtn">Forget & Reconnect</button>
+    </div>
+  </div>
+</section>
+
 </main>
 
 <!-- Load client JS from external endpoint to avoid parsing surprises -->
@@ -512,11 +553,11 @@ function saveRecipe() {
     if (!Array.isArray(recipes)) recipes = [];
     var newRecipe = { name: name, ingredients: ingredients, serving: serving, speed: speed, time: time };
     recipes.push(newRecipe);
-    return fetch('/api/recipes', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(recipes)
-    }).then(function(resp){
+    fetch('/api/recipes', {
+     method: 'POST',
+     headers: {'Content-Type':'application/x-www-form-urlencoded'},
+     body: 'plain=' + encodeURIComponent(JSON.stringify(recipes))
+     }).then(function(resp){
       if (!resp.ok) throw new Error('Save failed');
       // After save success, reload recipes and reset the form. Highlight the new one.
       resetRecipeForm();
@@ -676,10 +717,10 @@ function runRecipe(index) {
     if (index >= 0 && index < recipes.length) {
       var rec = recipes[index];
       fetch('/api/runrecipe', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({speed: rec.speed, time: rec.time})
-      }).then(function(){ alert('Recipe started! Motor will run for ' + (rec.time || 0) + ' seconds.'); });
+  method: 'POST',
+  headers: {'Content-Type':'application/x-www-form-urlencoded'},
+  body: 'plain=' + encodeURIComponent(JSON.stringify({speed: rec.speed, time: rec.time}))
+}).then(function(){ alert('Recipe started! Motor will run for ' + (rec.time || 0) + ' seconds.'); });
     }
   });
 }
@@ -749,6 +790,33 @@ window.onload = function() {
   initWebSocket();
   loadRecipes();
 };
+var wifiScanBtn = document.getElementById('wifiScanBtn');
+  if (wifiScanBtn) wifiScanBtn.addEventListener('click', function() {
+    fetch('/scanwifi')
+      .then(r => r.json())
+      .then(ssids => {
+        var list = document.getElementById('wifiScanList');
+        list.innerHTML = '';
+        ssids.forEach(function(ssid) {
+          var li = document.createElement('li');
+          li.innerText = ssid;
+          li.style.cursor = 'pointer';
+          li.style.padding = '8px';
+          li.style.borderBottom = '1px solid #eee';
+          li.onclick = function() {
+            alert('To connect to "' + ssid + '", please go to AP mode setup page.');
+          };
+          list.appendChild(li);
+        });
+      });
+  });
+
+  var forgetWifiBtn = document.getElementById('forgetWifiBtn');
+  if (forgetWifiBtn) forgetWifiBtn.addEventListener('click', function() {
+    fetch('/forgetwifi', { method: 'POST' })
+      .then(r => r.text())
+      .then(t => alert(t + '\nDevice will reboot and enter AP setup mode.'));
+  });
 )rawliteral";
 
 // ================== PINS & SETTINGS ==================
@@ -898,12 +966,13 @@ void startAPMode() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", wifiSetupHTML);
   });
-  server.on("/savewifi", HTTP_POST, [](AsyncWebServerRequest *request) {
+ server.on("/savewifi", HTTP_POST, [](AsyncWebServerRequest *request) {
     if(request->hasParam("ssid", true) && request->hasParam("pass", true)) {
       saveWiFiCredentials(request->getParam("ssid", true)->value(),
                          request->getParam("pass", true)->value());
-      request->send(200, "text/plain", "Saved! Rebooting...");
-      delay(500);
+      request->send(200, "text/html", "<html><body><h2>Saved WiFi credentials.</h2><p>Connecting…</p><p>If the connection is successful, reconnect your phone or PC to the same WiFi network and visit this device's IP address.</p></body></html>");
+
+      delay(1500);
       ESP.restart();
     }
   });
@@ -914,7 +983,16 @@ void setupAPIRoutes() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "text/html", indexHTML);
   });
-
+server.on("/scanwifi", HTTP_GET, [](AsyncWebServerRequest *req){
+  int n = WiFi.scanNetworks();
+  String json = "[";
+  for (int i = 0; i < n; ++i) {
+    if (i) json += ",";
+    json += "\"" + WiFi.SSID(i) + "\"";
+  }
+  json += "]";
+  req->send(200, "application/json", json);
+});
   // serve the external JS file
   server.on("/app.js", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "application/javascript", appJS);
@@ -990,7 +1068,45 @@ void setupAPIRoutes() {
     // Stub, empty for now
     req->send(200, "application/json", "[]");
   });
+server.on("/scanwifi", HTTP_GET, [](AsyncWebServerRequest *req){
+    int n = WiFi.scanNetworks();
+    String json = "[";
+    for (int i = 0; i < n; ++i) {
+      if (i) json += ",";
+      json += "\"" + WiFi.SSID(i) + "\"";
+    }
+    json += "]";
+    req->send(200, "application/json", json);
+  });
 
+  server.on("/forgetwifi", HTTP_POST, [](AsyncWebServerRequest *req){
+    preferences.begin("wifi", false);
+    preferences.clear();
+    preferences.end();
+    req->send(200, "text/plain", "Forgot WiFi, restarting");
+    delay(500);
+    ESP.restart();
+   });
+   // Scan WiFi networks and return JSON list
+  server.on("/scanwifi", HTTP_GET, [](AsyncWebServerRequest *req) {
+    int n = WiFi.scanNetworks();
+    String json = "[";
+    for (int i = 0; i < n; ++i) {
+      if (i) json += ",";
+      json += "\"" + WiFi.SSID(i) + "\"";
+    }
+    json += "]";
+    req->send(200, "application/json", json);
+  });
+  // Forget WiFi credentials and reboot into AP mode
+  server.on("/forgetwifi", HTTP_POST, [](AsyncWebServerRequest *req) {
+    preferences.begin("wifi", false);
+    preferences.clear();
+    preferences.end();
+    req->send(200, "text/plain", "Forgot WiFi! Rebooting to setup mode...");
+    delay(500);
+    ESP.restart();
+  });
   server.begin();
 }
 
@@ -1029,6 +1145,17 @@ void setup() {
 
 void loop() {
   if(isSTA){
+    static unsigned long wifiLostSince = 0;
+    const unsigned long wifiLostTimeout = 30000; // 30 seconds
+
+    if(WiFi.status() != WL_CONNECTED) {
+      if(wifiLostSince == 0) wifiLostSince = millis();
+      else if(millis() - wifiLostSince > wifiLostTimeout) {
+        ESP.restart();
+      }
+    } else {
+      wifiLostSince = 0;
+    }
     static unsigned long lastNotify = 0;
     unsigned long now = millis();
     if(now-lastNotify > 2000){
@@ -1040,5 +1167,14 @@ void loop() {
       setMotorSpeed(0);
       recipeRunning = false;
     }
+    // WiFi loss fallback: restart if disconnected for >30sec 
+    if(WiFi.status() != WL_CONNECTED){
+      if(wifiLostSince == 0) wifiLostSince = millis();
+      else if(millis() - wifiLostSince > 30000){ // 30 seconds lost
+        ESP.restart(); // will reboot and retry AP/STA logic
+      }
+    } else {
+      wifiLostSince = 0; // reset if reconnected
+     }
   }
 }
